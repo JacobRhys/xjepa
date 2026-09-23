@@ -223,6 +223,12 @@ class BenchConfig:
     measure_transfers: bool = True
     transfer_steps: int = 5
     autocast: bool = True
+    #: Whether a key-padding mask is passed to attention. ``True`` mirrors the
+    #: ``hybrid`` bucket policy (some padding, so a mask is required, so SDPA
+    #: can only reach cutlassF). ``False`` mirrors ``crop``, which leaves zero
+    #: padding and passes no mask at all -- the only route to the flash backend,
+    #: since PyTorch's flash path accepts only ``is_causal`` or no mask.
+    attn_mask: bool = True
     #: Which parameter count feeds ``6*N*D``. ``"measured"`` uses the built
     #: model's non-embedding count; any key of :data:`REFERENCE_PARAMS`
     #: ("encoder", "c1_mlm_tied", "c2_c3_jepa") pins it to the real model's
@@ -478,7 +484,7 @@ class BenchModel(nn.Module):
         return sum(p.numel() for p in self.parameters()) - emb
 
     def forward(
-        self, tokens: torch.Tensor, pad_mask: torch.Tensor, mask_sel: torch.Tensor
+        self, tokens: torch.Tensor, pad_mask: Optional[torch.Tensor], mask_sel: torch.Tensor
     ) -> torch.Tensor:
         b, l = tokens.shape
         x = self.embed(tokens)
@@ -487,7 +493,9 @@ class BenchModel(nn.Module):
         # Key-padding mask, broadcast rather than materialised, and built without
         # ever asking the host whether padding exists (`pad_mask.all()` would be a
         # device sync -- exactly what this harness is here to catch).
-        attn_mask = pad_mask[:, None, None, :]
+        # `None` means the batch has zero padding (the `crop` policy); passing an
+        # all-true mask instead would silently forfeit the flash backend.
+        attn_mask = None if pad_mask is None else pad_mask[:, None, None, :]
         for blk in self.blocks:
             x = blk(x, attn_mask)
         return self.head(self.ln_f(x))
@@ -528,7 +536,7 @@ def _build_model(cfg: BenchConfig, device: torch.device) -> Tuple[nn.Module, Lis
                 def forward(
                     self,
                     tokens: torch.Tensor,
-                    pad_mask: torch.Tensor,
+                    pad_mask: Optional[torch.Tensor],
                     mask_sel: torch.Tensor,
                 ) -> torch.Tensor:
                     return self.head(self.encoder(tokens, pad_mask))
@@ -795,6 +803,9 @@ def run_benchmark(cfg: BenchConfig, verbose: bool = True) -> BenchResult:
 
     def one_step(timed: bool) -> None:
         tokens, targets, pad_mask, mask_sel = corpus.batch(cfg.batch_size)
+        if not cfg.attn_mask:
+            # `crop` policy: zero padding, so no mask is built at all.
+            pad_mask = None
         if timed:
             clock.mark()
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
@@ -892,7 +903,7 @@ def run_benchmark(cfg: BenchConfig, verbose: bool = True) -> BenchResult:
         seq_len=cfg.seq_len,
         head_dim=cfg.d_model // cfg.n_heads,
         dtype=amp_dtype if use_amp else torch.float32,
-        has_attn_mask=True,
+        has_attn_mask=cfg.attn_mask,
     )
     if sdpa_backend.startswith("mem_efficient"):
         notes.append(

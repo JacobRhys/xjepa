@@ -260,12 +260,18 @@ class Encoder(nn.Module):
             if (p.requires_grad or not trainable_only)
         )
 
-    def forward(self, tokens: Tensor, pad_mask: Tensor) -> Tensor:
+    def forward(self, tokens: Tensor, pad_mask: Tensor | None) -> Tensor:
         """Encode a fixed-shape batch.
 
         Args:
             tokens: ``[B, L]`` int64 token ids.
-            pad_mask: ``[B, L]`` bool, ``True`` = real residue.
+            pad_mask: ``[B, L]`` bool, ``True`` = real residue, or ``None`` when
+                the batch is known to contain **no padding at all** (the ``crop``
+                bucket policy). ``None`` is not a convenience: passing an
+                all-true mask instead makes SDPA fall back from the flash
+                backend to cutlassF, since PyTorch's flash path accepts only
+                ``is_causal`` or no mask. The no-mask path is the only way to
+                reach flash, and it is worth roughly 1.4x end to end.
 
         Returns:
             ``[B, L, d_model]`` contextual representations. Padded positions are
@@ -273,8 +279,12 @@ class Encoder(nn.Module):
             positions are provably independent of anything at padded positions.
         """
         x = self.embed_tokens(tokens)
-        attn_bias = build_additive_mask(pad_mask, activation_dtype(x))
+        attn_bias = (
+            None if pad_mask is None else build_additive_mask(pad_mask, activation_dtype(x))
+        )
         for layer in self.layers:
             x = layer(x, attn_bias)
         x = self.ln_final(x)
+        if pad_mask is None:
+            return x
         return x * pad_mask.unsqueeze(-1).to(x.dtype)
