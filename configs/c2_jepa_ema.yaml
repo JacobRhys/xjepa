@@ -1,0 +1,75 @@
+# ---------------------------------------------------------------------------
+# X-JEPA protein study -- shared run configuration.
+#
+# The seven condition configs in this directory are BYTE-IDENTICAL except for
+# the `objective:` block at the bottom. That identity is the experimental
+# control: every condition sees the same data, the same model, the same
+# 1.0B-token budget (15300 steps x 65536 tokens) and the same optimiser, so any
+# difference in the results is attributable to the objective alone.
+#
+#   diff configs/c1_mlm.yaml configs/c3_jepa_frozen.yaml
+#
+# must show nothing but the objective block. Change anything above it in one
+# file and you must change it in all seven.
+#
+# The run name is taken from `objective.name`, so even the run identity does not
+# break the diff.
+# ---------------------------------------------------------------------------
+
+out_dir: runs
+seed: 0
+
+# --- data (identical across conditions) ------------------------------------
+corpus_path: data/corpus
+target_dim: 128
+tokens_per_step: 65536
+buckets: [128, 256, 384, 512]
+mask_rate: 0.15
+
+# --- model: ESM-2 t6 8M config, random init (RESEARCH_PLAN.md 3.1) ----------
+n_layers: 6
+d_model: 320
+n_heads: 20
+d_ff: 1280
+vocab: 33
+max_len: 512
+rope: true
+
+# --- optimisation: fixed token budget, NOT fixed wall-clock (3.3) ----------
+total_tokens: 1000000000    # THE budget. Counted in tokens, never in epochs:
+                            # the hybrid bucket policy random-crops ~14% of
+                            # residues per pass, so an epoch is not a fixed
+                            # quantity of data. Whichever of total_tokens /
+                            # total_steps binds first ends the run.
+total_steps: 15300          # 15300 x 65536 = 1.00B tokens (schedule horizon)
+base_lr: 4.0e-4
+warmup_steps: 500
+min_lr_ratio: 0.0
+weight_decay: 0.01
+betas: [0.9, 0.98]
+eps: 1.0e-8
+grad_clip: 1.0
+
+# --- runtime ---------------------------------------------------------------
+device: cuda
+compile: true
+bf16: true
+max_minutes: 35.0           # hard budget guard; also enforced by --max-minutes
+
+# --- logging / checkpointing ----------------------------------------------
+log_every: 50               # one device->host sync per 50 steps
+collapse_every: 500         # RankMe / dim-std / off-diagonal covariance
+checkpoint_every: 1000      # atomic; a preemption costs <= 1000 steps
+
+# --- objective -------------------------------------------------------------
+# C2: predict EMA-target-encoder latents at masked positions.
+# EXPECTED TO COLLAPSE (hypothesis H1a) -- that is the replication result.
+# Deliberately no anti-collapse term: no centring, no whitening, no VICReg.
+objective:
+  name: c2_jepa_ema
+  lambda_jepa: 1.0
+  cos_weight: 1.0
+  l1_weight: 1.0
+  smooth_l1_beta: 1.0
+  ema_tau_base: 0.996
+  ema_tau_final: 1.0
