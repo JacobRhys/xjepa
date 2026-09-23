@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+.DS_Store
+
+# generated artefacts, repo root only -- anchored so they cannot swallow
+# source directories such as xjepa/data/
+/data/
+/cache/
+/runs/
+/checkpoints/
+*.npy
+*.safetensors
+*.pdb
