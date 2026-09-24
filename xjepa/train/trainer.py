@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import random
 import sys
@@ -55,6 +56,7 @@ from xjepa.train.schedule import LrSchedule, ScheduleConfig, ema_tau_at
 
 __all__ = [
     "RunConfig",
+    "apply_overrides",
     "MetricBuffer",
     "XJepaModel",
     "Trainer",
@@ -96,6 +98,14 @@ class RunConfig:
     tokens_per_step: int = 65_536
     buckets: tuple[int, ...] = (128, 256, 384, 512)
     mask_rate: float = 0.15
+    #: "random" (15% per residue, ESM-2) or "span" (geometric, mean 8) -- the
+    #: masking ablation of RESEARCH_PLAN.md sec. 4, run on C3 only.
+    mask_mode: str = "random"
+    mean_span: float = 8.0
+    #: Bucket policy: "hybrid" (pad up at >=0.85 occupancy, else crop),
+    #: "crop" (zero padding, reaches the flash SDPA backend), or "pad".
+    #: Settled by scripts/pilot.py; must be identical across all conditions.
+    bucket_policy: str = "hybrid"
 
     # --- model ----------------------------------------------------------- #
     n_layers: int = 6
@@ -933,29 +943,54 @@ class Trainer:
 # --------------------------------------------------------------------------- #
 
 
-def build_batches(cfg: RunConfig):
-    """Construct the on-device corpus and bucket batcher (lazy import).
+def build_batches(cfg: RunConfig, objective: Objective | None = None):
+    """Construct the on-device corpus, masker and bucket batcher (lazy import).
 
     Per the contract there is no ``DataLoader``: the corpus lives in VRAM and
     batching is index arithmetic on device.
 
+    The corruption scheme follows the objective rather than the config, because
+    it is not a free parameter: MLM conditions need ESM-2's 80/10/10, latent
+    conditions need every masked position replaced by ``<mask>``, and the
+    unmasked controls (C5, C5c) need no masker at all -- with ``masker=None``
+    the batcher emits all-false ``mask_sel`` and all ``-100`` labels, so
+    ``original_tokens`` recovers the clean sequence.
+
     Args:
         cfg: Run config.
+        objective: The built objective, used to pick the corruption scheme and
+            whether to mask at all. ``None`` falls back to plain JEPA masking.
 
     Returns:
         ``(corpus, batcher)`` -- the corpus is returned so the trainer can record
         its ``summary()`` (measured VRAM residency) rather than trusting the
         table in ``docs/CONTRACTS.md``.
     """
+    from xjepa.data.masking import MaskingConfig, Masker
     from xjepa.data.store import BucketBatcher, GpuCorpus
 
     corpus = GpuCorpus.load(cfg.corpus_path, device=cfg.device, target_dim=cfg.target_dim)
+
+    masker = None
+    if objective is None or objective.uses_masking:
+        corruption = "mlm" if (objective is not None and objective.needs_mlm_head) else "jepa"
+        masker = Masker(
+            MaskingConfig(
+                mode=cfg.mask_mode,
+                rate=cfg.mask_rate,
+                mean_span=cfg.mean_span,
+                corruption=corruption,
+            ),
+            generator=torch.Generator(device=cfg.device).manual_seed(cfg.seed),
+        )
+
     batcher = BucketBatcher(
         corpus,
         buckets=cfg.buckets,
-        tokens_per_step=cfg.tokens_per_step,
-        mask_rate=cfg.mask_rate,
+        token_budget=cfg.tokens_per_step,
+        masker=masker,
         seed=cfg.seed,
+        policy=cfg.bucket_policy,
     )
     return corpus, batcher
 
@@ -979,7 +1014,54 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--total-tokens", type=int, default=None, help="Override the token budget (pilot runs).")
     p.add_argument("--no-compile", action="store_true", help="Disable torch.compile (debugging).")
     p.add_argument("--resume", action="store_true", help="Resume from the newest checkpoint in the run dir.")
+    p.add_argument(
+        "--set", action="append", default=[], metavar="KEY=VALUE", dest="overrides",
+        help=(
+            "Override one config field, repeatable. Dotted keys reach into the "
+            "objective block (e.g. --set objective.lambda_jepa=0.1). Values are "
+            "parsed as YAML, so numbers and booleans keep their types. Used by "
+            "scripts/run_grid.py for the lambda sweep and the target variants."
+        ),
+    )
     return p.parse_args(argv)
+
+
+def apply_overrides(cfg: RunConfig, overrides: Sequence[str]) -> RunConfig:
+    """Apply ``--set KEY=VALUE`` overrides to a loaded config.
+
+    Unknown keys raise rather than silently doing nothing: a typo in a grid
+    override would otherwise produce a run that looks like the variant you asked
+    for and is actually the baseline.
+
+    Args:
+        cfg: The loaded run config.
+        overrides: ``"key=value"`` strings; ``objective.`` prefixes the objective block.
+
+    Returns:
+        A new :class:`RunConfig`.
+    """
+    import yaml
+
+    top: dict[str, Any] = {}
+    obj: dict[str, Any] = {}
+    for item in overrides:
+        if "=" not in item:
+            raise SystemExit(f"--set expects KEY=VALUE, got {item!r}")
+        key, raw = item.split("=", 1)
+        value = yaml.safe_load(raw)
+        if key.startswith("objective."):
+            field_name = key.split(".", 1)[1]
+            if field_name not in ObjectiveConfig.__dataclass_fields__:
+                raise SystemExit(f"--set: unknown objective field {field_name!r}")
+            obj[field_name] = value
+        else:
+            if key not in RunConfig.__dataclass_fields__:
+                raise SystemExit(f"--set: unknown config field {key!r}")
+            top[key] = value
+
+    if obj:
+        top["objective"] = replace(cfg.objective, **obj)
+    return replace(cfg, **top) if top else cfg
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1001,6 +1083,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         total_steps=args.total_steps,
         total_tokens=args.total_tokens,
     )
+    if args.overrides:
+        cfg = apply_overrides(cfg, args.overrides)
     if args.no_compile:
         cfg = replace(cfg, compile=False)
     if cfg.objective.name not in OBJECTIVE_NAMES:
@@ -1009,13 +1093,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     seed_everything(cfg.seed)
     objective = build_objective(cfg.objective)
     model = build_model(cfg, objective).to(cfg.device)
-    corpus, batcher = build_batches(cfg)
+    corpus, batcher = build_batches(cfg, objective)
     trainer = Trainer(cfg, model, objective, batcher, corpus=corpus)
     if args.resume:
         trainer.resume()
 
     trainer.fit()
     summary = trainer.summary()
+    # Persisted as the run's completion marker: scripts/run_grid.py treats the
+    # presence of summary.json as "this cell finished", which is what makes the
+    # grid resumable after a spot preemption.
+    with open(trainer.run_dir / "summary.json", "w", encoding="utf-8") as fh:
+        json.dump({**summary, "config": cfg.to_dict()}, fh, indent=2, default=str)
     print(" ".join(f"{k}={v}" for k, v in summary.items()))
     return 0
 

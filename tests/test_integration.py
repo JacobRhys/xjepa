@@ -152,3 +152,76 @@ def test_pilot_costing_is_monotone_in_throughput() -> None:
     assert fast.minutes_per_run < slow.minutes_per_run
     # 1.4e6 tok/s -> ~12 min/run, 23 runs -> the plan's ~£6 envelope
     assert fast.within_budget
+
+
+def _tiny_corpus(tmp_path, n_seqs: int = 64, dim: int = 8):
+    """Write a minimal on-disk corpus in the layout GpuCorpus.load expects."""
+    import numpy as np
+
+    rng = np.random.default_rng(0)
+    lengths = rng.integers(20, 60, size=n_seqs)
+    offsets = np.zeros(n_seqs + 1, dtype=np.int64)
+    np.cumsum(lengths, out=offsets[1:])
+    total = int(offsets[-1])
+
+    d = tmp_path / "corpus"
+    d.mkdir()
+    np.save(d / "tokens.npy", rng.integers(4, 24, size=total).astype("uint8"))
+    np.save(d / "offsets.npy", offsets.astype("int32"))
+    np.save(d / "targets.npy", rng.standard_normal((total, dim)).astype("float16"))
+    return d
+
+
+@pytest.mark.parametrize("name", OBJECTIVE_NAMES)
+def test_build_batches_wires_to_the_real_batcher(tmp_path, name: str) -> None:
+    """build_batches must match BucketBatcher/Masker's actual signatures.
+
+    Nothing else covers this: the trainer's own tests feed hand-built batches,
+    so a keyword-argument drift here surfaces only when a real corpus is loaded
+    -- i.e. on the rented GPU, after paying for it.
+    """
+    from xjepa.train.trainer import build_batches
+
+    corpus_dir = _tiny_corpus(tmp_path)
+    cfg = _tiny_config(name)
+    cfg.corpus_path = str(corpus_dir)
+    cfg.target_dim = 8
+    cfg.buckets = (32, 64)
+    cfg.tokens_per_step = 512
+    objective = build_objective(cfg.objective)
+
+    corpus, batcher = build_batches(cfg, objective)
+    batch = next(iter(batcher))
+
+    assert batch.tokens.shape == batch.pad_mask.shape
+    assert batch.targets.shape[-1] == 8
+    assert batch.bucket in cfg.buckets
+
+    if objective.uses_masking:
+        assert batch.mask_sel.any(), f"{name}: masker produced no masked positions"
+        assert not (batch.mask_sel & ~batch.pad_mask).any(), "padding was masked"
+    else:
+        # No masker: labels are all -100, so the clean sequence is recoverable.
+        assert not batch.mask_sel.any()
+        assert (batch.labels == -100).all()
+
+
+def test_build_batches_corruption_follows_the_objective(tmp_path) -> None:
+    """MLM conditions get 80/10/10; latent conditions get pure <mask>."""
+    from xjepa.data.masking import MASK_ID
+    from xjepa.train.trainer import build_batches
+
+    corpus_dir = _tiny_corpus(tmp_path)
+
+    def batch_for(name: str):
+        cfg = _tiny_config(name)
+        cfg.corpus_path, cfg.target_dim = str(corpus_dir), 8
+        cfg.buckets, cfg.tokens_per_step = (32, 64), 512
+        return next(iter(build_batches(cfg, build_objective(cfg.objective))[1]))
+
+    jepa = batch_for("c3_jepa_frozen")
+    assert (jepa.tokens[jepa.mask_sel] == MASK_ID).all(), "JEPA must mask every selected position"
+
+    mlm = batch_for("c1_mlm")
+    masked_inputs = mlm.tokens[mlm.mask_sel]
+    assert (masked_inputs != MASK_ID).any(), "MLM should leave ~20% un-masked (80/10/10)"

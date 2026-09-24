@@ -63,7 +63,46 @@ xjepa/perf/    benchmark and profiling harness
 
 ```bash
 pip install -e ".[dev]"
-pytest                                    # CPU, tiny shapes
-python -m xjepa.perf.bench                # throughput, MFU, per-step transfer bytes
-python -m xjepa.train.trainer --config configs/c3_jepa_frozen.yaml --seed 0
+pytest                                            # CPU, tiny shapes
+
+# Phase 1 -- pilot. Gates everything else: settles bucket policy and head
+# count by measurement, and recomputes the budget from measured throughput.
+python scripts/pilot.py --out runs/pilot
+
+# Phase 2 -- data (laptop, free)
+python scripts/fetch_afdb.py --from-uniprot --target 50000 --out data/structures
+python scripts/fetch_eval_data.py --list-sources     # verify URLs before trusting them
+python scripts/fetch_eval_data.py --out data/eval
+python scripts/cluster_and_filter.py --fasta data/structures/sequences.fasta \
+    --eval-fasta data/eval/*/test.fasta --out data/splits
+
+# Phase 3 -- structure targets. Pilot the throughput before the full run.
+python scripts/extract_esmif1.py --shards data/structures \
+    --allowlist data/splits/pretrain_accessions.txt --out data/raw --limit 500
+python -m xjepa.data.build_cache --embeddings data/raw/esmif1_512.npy \
+    --tokens data/raw/tokens.npy --offsets data/raw/offsets.npy \
+    --out data/corpus --dim 128
+python scripts/extract_3di.py --shards data/structures \
+    --allowlist data/splits/pretrain_accessions.txt --out data/raw_3di
+
+# Phase 4 -- the grid, in tiers, under a hard spend cap
+python scripts/run_grid.py --corpus data/corpus --out runs/ --tier 1
+python scripts/run_grid.py --corpus data/corpus --out runs/ --tier 2 --tier 3
+
+# Phases 5-6 -- evaluate and aggregate
+python scripts/run_eval.py --runs runs/ --eval-data data/eval --out results/
+python scripts/aggregate_results.py --results results/ --out report/
 ```
+
+### Three gates
+
+Stop and look at the numbers before spending more:
+
+1. **Pilot invariants** -- host-to-device bytes and implicit syncs must be zero.
+   If not, the efficiency design has a hole.
+2. **Target bank RankMe** (from `build_cache`'s `meta.json`) -- this is the H1b
+   ceiling on what C3 can learn. A low value is a go/no-go, and it is known
+   before any grid time is spent.
+3. **Tier 1 collapse check** -- `run_grid.py` prints it. If C2 does not collapse,
+   the replication failed and the framing needs rethinking; tier 1 is the
+   cheapest place to find that out.
