@@ -21,8 +21,17 @@ is closer in form to MLM than the ESM-IF1 version is, which weakens the "this
 is not disguised token prediction" argument -- so treat it as a check on the
 main result, not a replacement for it.
 
-Requires Foldseek on PATH (``brew install foldseek`` / ``conda install -c
-bioconda foldseek``)::
+Requires Foldseek on PATH. It is **not** in homebrew-core; upstream ships
+official binaries::
+
+    # macOS (universal), Linux builds also at https://mmseqs.com/foldseek/
+    curl -fsSL https://mmseqs.com/foldseek/foldseek-osx-universal.tar.gz | tar xz
+    ln -s "$PWD/foldseek/bin/foldseek" /opt/homebrew/bin/foldseek
+
+    # or via conda
+    conda install -c conda-forge -c bioconda foldseek
+
+Then::
 
     python scripts/extract_3di.py --shards data/structures \\
         --allowlist data/splits/pretrain_accessions.txt --out data/raw_3di
@@ -60,8 +69,11 @@ def require_foldseek() -> str:
     exe = shutil.which("foldseek")
     if exe is None:
         print(
-            "foldseek not found on PATH.\n"
-            "  macOS:  brew install foldseek\n"
+            "foldseek not found on PATH. It is NOT in homebrew-core; use the\n"
+            "official upstream binary or conda:\n"
+            "  curl -fsSL https://mmseqs.com/foldseek/foldseek-osx-universal.tar.gz | tar xz\n"
+            "  ln -s \"$PWD/foldseek/bin/foldseek\" /opt/homebrew/bin/foldseek\n"
+            "  (Linux builds: https://mmseqs.com/foldseek/)\n"
             "  conda:  conda install -c conda-forge -c bioconda foldseek",
             file=sys.stderr,
         )
