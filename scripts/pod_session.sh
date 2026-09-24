@@ -72,6 +72,17 @@ REPO_URL="${REPO_URL:-}"
 STARTED_AT=$(date -u +%s)
 
 log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
+
+# The CLI was renamed: `huggingface-cli` is deprecated and from
+# huggingface_hub 1.x it refuses to run. Prefer `hf`, fall back for old images.
+# Neither version has a --quiet flag, so output is redirected instead.
+if command -v hf >/dev/null 2>&1; then
+  HF_CLI=hf
+elif command -v huggingface-cli >/dev/null 2>&1; then
+  HF_CLI=huggingface-cli
+else
+  HF_CLI=""
+fi
 elapsed_min() { echo $(( ( $(date -u +%s) - STARTED_AT ) / 60 )); }
 
 # --------------------------------------------------------------------------- #
@@ -94,8 +105,8 @@ push_results() {
   local ok=1
   for dir in runs results report data/corpus; do
     [[ -d "$WORKDIR/$dir" ]] || continue
-    if huggingface-cli upload "$HF_REPO" "$WORKDIR/$dir" "$dir" \
-         --repo-type dataset --quiet 2>&1 | tail -2 >&2; then
+    if "$HF_CLI" upload "$HF_REPO" "$WORKDIR/$dir" "$dir" \
+         --repo-type dataset >/dev/null 2>&1; then
       log "  pushed $dir"
     else
       log "  FAILED to push $dir"
@@ -207,6 +218,12 @@ if [[ -z "${HF_TOKEN:-}" ]]; then
   log "HF_TOKEN is unset -- the results push would fail. Refusing to start."
   exit 1
 fi
+if [[ -z "$HF_CLI" ]]; then
+  log "No HuggingFace CLI found. Results would have nowhere to go."
+  log "  pip install -U huggingface_hub"
+  exit 1
+fi
+log "HuggingFace CLI: ${HF_CLI}"
 if [[ "$TERMINATE" -eq 1 && -z "${RUNPOD_POD_ID:-}" ]]; then
   log "RUNPOD_POD_ID is unset, so this script cannot terminate the instance."
   log "Either run on a RunPod pod, or pass --no-terminate and kill it yourself."
@@ -251,8 +268,8 @@ fi
 if [[ "$PHASE" == "grid" || "$PHASE" == "eval" ]]; then
   if [[ ! -d data/corpus ]]; then
     log "pulling corpus from ${HF_REPO}"
-    huggingface-cli download "$HF_REPO" --repo-type dataset \
-      --include 'data/corpus/*' --local-dir . --quiet
+    "$HF_CLI" download "$HF_REPO" --repo-type dataset \
+      --include 'data/corpus/*' --local-dir .
   fi
   [[ -f data/corpus/targets.npy ]] || { log "no corpus after pull -- run 'extract' first"; exit 1; }
 fi
@@ -272,11 +289,11 @@ if [[ "$HEARTBEAT" -eq 1 ]]; then
         nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader
         ls -1 runs 2>/dev/null | tail -5
       } > /tmp/heartbeat.txt 2>/dev/null
-      huggingface-cli upload "$HF_REPO" /tmp/heartbeat.txt heartbeat.txt \
-        --repo-type dataset --quiet >/dev/null 2>&1 || true
+      "$HF_CLI" upload "$HF_REPO" /tmp/heartbeat.txt heartbeat.txt \
+        --repo-type dataset >/dev/null 2>&1 || true
       for d in runs results; do
-        [[ -d "$d" ]] && huggingface-cli upload "$HF_REPO" "$d" "$d" \
-          --repo-type dataset --quiet >/dev/null 2>&1 || true
+        [[ -d "$d" ]] && "$HF_CLI" upload "$HF_REPO" "$d" "$d" \
+          --repo-type dataset >/dev/null 2>&1 || true
       done
     done ) >/dev/null 2>&1 &
   HEARTBEAT_PID=$!
