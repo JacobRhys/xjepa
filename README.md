@@ -94,6 +94,28 @@ python scripts/run_eval.py --runs runs/ --eval-data data/eval --out results/
 python scripts/aggregate_results.py --results results/ --out report/
 ```
 
+### Running it on a rented pod
+
+`scripts/pod_session.sh` runs one phase and then terminates the instance. A
+forgotten pod costs roughly £6 a night -- the whole budget -- and monitoring does
+not protect against that; the instance ending itself does.
+
+```bash
+export HF_REPO=youruser/xjepa HF_TOKEN=hf_...   # results land here
+export RUNPOD_API_KEY=...                        # RUNPOD_POD_ID is already set
+
+./scripts/pod_session.sh pilot --no-terminate    # first time: watch it
+./scripts/pod_session.sh extract                 # needs a 60 GB container disk
+./scripts/pod_session.sh grid --tier 1
+./scripts/pod_session.sh eval
+```
+
+It refuses to start without somewhere to put results, runs the test suite before
+spending GPU time on a broken tree, pushes a heartbeat every 10 minutes so
+progress is visible without SSH, and enforces a hard wall-clock ceiling per
+phase. **If the results push fails it does not terminate** -- another hour of
+credit is recoverable, four hours of lost extraction is not.
+
 ### Three gates
 
 Stop and look at the numbers before spending more:
