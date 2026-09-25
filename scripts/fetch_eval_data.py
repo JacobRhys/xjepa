@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import shutil
 import tarfile
 import urllib.error
 import urllib.request
@@ -130,6 +131,54 @@ def download(url: str, dest: Path, homepage: str) -> Path:
         )
         raise SystemExit(1) from exc
     return dest
+
+
+class EvalPusher:
+    """Upload converted eval splits to HuggingFace and free the local copies.
+
+    Phase 5's raw archives are the real disk problem, not the converted output:
+    ProteinNet and the ProteinGym substitutions run to ~1 GB each, while the
+    ``.npz`` splits they produce are a fraction of that. So this deletes the
+    downloaded archive as soon as its conversion succeeds, and optionally the
+    converted splits too once they are safely on the Hub.
+    """
+
+    def __init__(self, repo: str, prefix: str = "data/eval"):
+        from huggingface_hub import HfApi
+
+        self.repo = repo
+        self.prefix = prefix.strip("/")
+        self.api = HfApi()
+        self.pushed = 0
+        self.failed: list[str] = []
+        self.api.create_repo(repo, repo_type="dataset", private=True, exist_ok=True)
+
+    def push_dir(self, task_dir: Path, delete_local: bool = False) -> bool:
+        """Upload every file in a converted task directory."""
+        ok = True
+        for path in sorted(task_dir.rglob("*")):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(task_dir.parent)
+            try:
+                self.api.upload_file(
+                    path_or_fileobj=str(path),
+                    path_in_repo=f"{self.prefix}/{rel.as_posix()}",
+                    repo_id=self.repo,
+                    repo_type="dataset",
+                )
+                self.pushed += 1
+            except Exception as exc:  # noqa: BLE001 - never lose data to an upload
+                print(f"[eval] upload FAILED for {rel}: {exc}", file=sys.stderr)
+                self.failed.append(str(rel))
+                ok = False
+        if ok and delete_local:
+            # Keep the test FASTA: cluster_and_filter.py needs it locally and it
+            # is tiny compared with the splits.
+            for path in sorted(task_dir.rglob("*")):
+                if path.is_file() and path.name != "test.fasta":
+                    path.unlink(missing_ok=True)
+        return ok
 
 
 def write_split(
@@ -361,6 +410,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--list-sources", action="store_true")
     p.add_argument("--max-assays", type=int, default=10, help="ProteinGym subset size")
     p.add_argument("--max-len", type=int, default=400, help="ProteinGym length cap")
+    p.add_argument("--push-to", default=None, metavar="REPO",
+                   help="HuggingFace dataset to upload converted splits to")
+    p.add_argument("--free-space", action="store_true",
+                   help="with --push-to, delete converted splits locally after upload "
+                        "(test.fasta is kept -- the leakage filter needs it). Raw "
+                        "archives are deleted after a successful conversion either way.")
     args = p.parse_args(argv)
 
     overrides = dict(u.split("=", 1) for u in args.url)
@@ -380,6 +435,9 @@ def main(argv: list[str] | None = None) -> int:
 
     args.out.mkdir(parents=True, exist_ok=True)
     cache = args.out / "_downloads"
+    pusher = EvalPusher(args.push_to) if args.push_to else None
+    if pusher:
+        print(f"[eval] uploading converted splits to {args.push_to}", file=sys.stderr)
 
     for task in args.tasks:
         src_def = SOURCES[task]
@@ -442,6 +500,17 @@ def main(argv: list[str] | None = None) -> int:
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
         print(f"[eval] {task} -> {out_dir}", file=sys.stderr)
+
+        # The raw archive has served its purpose; on a constrained disk it is the
+        # single biggest thing lying around (ProteinNet and ProteinGym ~1 GB each).
+        if not args.from_local and isinstance(raw, Path) and raw.is_file():
+            size_mb = raw.stat().st_size / 1e6
+            raw.unlink(missing_ok=True)
+            shutil.rmtree(cache / f"{task}_x", ignore_errors=True)
+            print(f"[eval] freed {size_mb:.0f} MB of raw archive for {task}", file=sys.stderr)
+
+        if pusher and pusher.push_dir(out_dir, delete_local=args.free_space):
+            print(f"[eval] {task} uploaded", file=sys.stderr)
 
     print(
         f"\n[eval] done. Pass the test FASTAs to the L0 leakage filter:\n"
