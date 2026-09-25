@@ -10,12 +10,16 @@ At our scale this is not an optimisation, it is a structural property:
 
 | Asset | Size | Resident |
 |---|---|---|
-| Token ids, 12.5M residues, uint8 | 11.9 MB | GPU |
+| Token ids, 17.0M residues, uint8 | 16.2 MB | GPU |
 | Sequence offsets + lengths, int32 | 0.4 MB | GPU |
-| Target bank, 12.5M x 128, fp16 (PCA-reduced) | 2.98 GiB | GPU |
+| Target bank, 17.0M x 128, fp16 (PCA-reduced) | 4.05 GiB | GPU |
 | Model + optimiser states, 8M params | ~0.2 GB | GPU |
 
-Total ~2.99 GiB on a 24 GB card (3.6 GiB if the corpus reaches 15M residues).
+Total ~4.3 GiB on a 24 GB card. MEASURED from the built corpus: 49,000 chains,
+16,991,211 residues (mean length 347). The earlier 12.5M estimate assumed a mean
+of 250; cropping long proteins into 512-residue windows raised it.
+The *raw* 512-d bank before PCA is 15.6 GiB, so the extraction pod needs its
+60 GB container disk -- that figure is not generous, it is necessary.
 This is AT the 3 GB line, not comfortably under it -- `GpuCorpus.summary()` reports
 the real figure at startup, so size from that, never from this table. There is therefore **no DataLoader, no worker processes,
 no pin_memory, no prefetch stream, and no collate function.** Batching is index arithmetic
