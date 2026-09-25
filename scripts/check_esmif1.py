@@ -113,7 +113,7 @@ def check_alignment(device: torch.device, lengths: tuple[int, ...]) -> int:
         varies = float(rep.std()) > 1e-6
         status = "OK" if (shape_ok and finite and varies) else "FAIL"
         print(
-            f"L={length:<5} shape={tuple(rep.shape):<12} finite={finite} "
+            f"L={length:<5} shape={str(tuple(rep.shape)):<14} finite={finite} "
             f"std={float(rep.std()):.4f}  {status}"
         )
         if status == "FAIL":
