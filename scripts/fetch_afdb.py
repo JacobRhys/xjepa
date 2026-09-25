@@ -117,16 +117,67 @@ BACKBONE_ATOMS = ("N", "CA", "C")
 
 @dataclass
 class Chain:
-    """One parsed AFDB model."""
+    """One parsed AFDB model, possibly a window of a longer protein."""
 
     accession: str
     seq: str
     coords: np.ndarray  # float32 [L, 3, 3] -- N, CA, C
     plddt: np.ndarray  # float32 [L]
+    orig_len: int = 0  # full length before cropping; 0 means "same as seq"
+    crop_start: int = 0  # offset of this window within the full protein
+
+    def __post_init__(self) -> None:
+        if not self.orig_len:
+            self.orig_len = len(self.seq)
 
     @property
     def mean_plddt(self) -> float:
         return float(self.plddt.mean()) if self.plddt.size else 0.0
+
+    @property
+    def was_cropped(self) -> bool:
+        return self.orig_len > len(self.seq)
+
+
+def crop_chain(chain: Chain, window: int) -> Chain:
+    """Take a ``window``-residue slice of a protein longer than the context.
+
+    Cropping rather than discarding is the field convention -- ESM-2 random-crops
+    to its context window and AlphaFold2 trains on 256-residue crops -- because
+    protein length is heavily long-tailed. Filtering by length does not give a
+    smaller unbiased corpus, it gives one skewed toward single-domain proteins,
+    and at a 512 window that would discard ~19% of Swiss-Prot including most
+    multi-domain architectures.
+
+    The window start is derived from the accession, so a re-run reproduces the
+    same crop without threading an RNG through the download pool.
+
+    What is lost: contacts reaching outside the window are invisible to the
+    sequence encoder. What is not: ESM-IF1 computes its targets from the
+    *complete* structure, so even a cropped window carries targets that encode
+    the whole fold's environment.
+
+    Args:
+        chain: The parsed full-length chain.
+        window: Context length to crop to.
+
+    Returns:
+        A new :class:`Chain` of length ``window`` recording its provenance, or
+        ``chain`` unchanged when it already fits.
+    """
+    length = len(chain.seq)
+    if length <= window:
+        return chain
+    rng = np.random.default_rng(abs(hash(chain.accession)) % (2**32))
+    start = int(rng.integers(0, length - window + 1))
+    return Chain(
+        accession=chain.accession,
+        seq=chain.seq[start : start + window],
+        coords=chain.coords[start : start + window],
+        plddt=chain.plddt[start : start + window],
+        orig_len=length,
+        crop_start=start,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -144,7 +195,7 @@ def read_accessions(path: Path) -> list[str]:
     return out
 
 
-def uniprot_accessions(target: int, min_len: int, max_len: int) -> Iterator[str]:
+def uniprot_accessions(target: int, min_len: int, max_len: int | None) -> Iterator[str]:
     """Stream reviewed (Swiss-Prot) accessions from the UniProt REST API.
 
     Args:
@@ -155,7 +206,8 @@ def uniprot_accessions(target: int, min_len: int, max_len: int) -> Iterator[str]
     Yields:
         UniProt accessions.
     """
-    query = f"reviewed:true AND length:[{min_len} TO {max_len}]"
+    upper = max_len if max_len is not None else "*"
+    query = f"reviewed:true AND length:[{min_len} TO {upper}]"
     params = {"query": query, "format": "list", "size": "500"}
     url = f"{UNIPROT_SEARCH}?{urllib.parse.urlencode(params)}"
     seen = 0
@@ -288,11 +340,14 @@ def parse_backbone(text: str, accession: str) -> Chain | None:
 
 
 def keep(chain: Chain, min_len: int, max_len: int, min_plddt: float) -> bool:
-    """Apply the plan's filters to one chain."""
-    return (
-        min_len <= len(chain.seq) <= max_len
-        and chain.mean_plddt >= min_plddt
-    )
+    """Apply the plan's filters to one chain.
+
+    ``max_len`` is checked, but a cropped chain is already at most ``max_len``,
+    so in practice this only rejects over-long chains when cropping is disabled.
+    pLDDT is evaluated on the *kept* residues, so a crop is judged on the window
+    that actually enters the corpus rather than on the whole protein.
+    """
+    return min_len <= len(chain.seq) <= max_len and chain.mean_plddt >= min_plddt
 
 
 # --------------------------------------------------------------------------- #
@@ -320,6 +375,8 @@ def write_shard(path: Path, chains: list[Chain]) -> None:
         offsets=offsets,
         coords=np.concatenate([c.coords for c in chains], axis=0),
         plddt=np.concatenate([c.plddt for c in chains], axis=0),
+        orig_len=np.array([c.orig_len for c in chains], dtype=np.int32),
+        crop_start=np.array([c.crop_start for c in chains], dtype=np.int32),
         allow_pickle=True,
     )
     tmp.replace(path)
@@ -397,7 +454,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--target", type=int, default=50_000, help="how many chains to keep")
     p.add_argument("--min-len", type=int, default=40,
                    help="raise to 128 if the pilot chose the crop bucket policy")
-    p.add_argument("--max-len", type=int, default=512)
+    p.add_argument("--max-len", type=int, default=512,
+                   help="context window; longer proteins are cropped into it")
+    p.add_argument("--no-crop-long", action="store_true",
+                   help="reject proteins longer than --max-len instead of cropping "
+                        "them. Discards ~19%% of Swiss-Prot at a 512 window, "
+                        "including most multi-domain architectures -- the field "
+                        "convention is to crop.")
     p.add_argument("--min-plddt", type=float, default=70.0)
     p.add_argument("--shard-size", type=int, default=2000)
     p.add_argument("--workers", type=int, default=8,
@@ -429,21 +492,25 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print("[fetch] streaming reviewed accessions from UniProt ...", file=sys.stderr)
         accessions = uniprot_accessions(
-            target=args.target * 3,  # oversample: not every accession has a model
+            target=args.target * 3,  # oversample: not every accession passes pLDDT
             min_len=args.min_len,
-            max_len=args.max_len,
+            # When cropping, long proteins are wanted, so do not cap the query.
+            max_len=args.max_len if args.no_crop_long else None,
         )
 
     kept: list[Chain] = []
     shard_idx = 0
-    n_kept = n_seen = n_missing = n_filtered = 0
+    n_kept = n_seen = n_missing = n_filtered = n_cropped = 0
     t0 = time.time()
 
     def work(acc: str) -> Chain | None:
         text = fetch_pdb(acc, args.model_version, args.retries, args.backoff)
         if text is None:
             return None
-        return parse_backbone(text, acc)
+        chain = parse_backbone(text, acc)
+        if chain is None or args.no_crop_long:
+            return chain
+        return crop_chain(chain, args.max_len)
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         for chain in pool.map(work, accessions):
@@ -455,6 +522,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 kept.append(chain)
                 n_kept += 1
+                n_cropped += int(chain.was_cropped)
 
             if len(kept) >= args.shard_size:
                 path = args.out / f"shard_{shard_idx:04d}.npz"
@@ -489,6 +557,8 @@ def main(argv: list[str] | None = None) -> int:
         "n_seen": n_seen,
         "n_no_model": n_missing,
         "n_filtered_out": n_filtered,
+        "n_cropped_from_longer": n_cropped,
+        "crop_long_proteins": not args.no_crop_long,
         "n_shards": shard_idx,
         "filters": {
             "min_len": args.min_len,
@@ -512,7 +582,8 @@ def main(argv: list[str] | None = None) -> int:
                   file=sys.stderr)
 
     print(
-        f"\n[fetch] kept {n_kept:,} chains in {shard_idx} shards -> {args.out}\n"
+        f"\n[fetch] kept {n_kept:,} chains in {shard_idx} shards "
+        f"({n_cropped:,} cropped from longer proteins) -> {args.out}\n"
         f"[fetch] {n_missing:,} accessions had no AFDB model; "
         f"{n_filtered:,} failed the length/pLDDT filters\n"
         f"[fetch] FASTA for clustering: {fasta}",

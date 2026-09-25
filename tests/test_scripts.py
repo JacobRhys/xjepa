@@ -221,3 +221,78 @@ def test_write_pdb_is_reparseable(tmp_path: Path) -> None:
     assert chain is not None
     assert chain.seq == seq
     assert np.allclose(chain.coords, coords, atol=1e-3)
+
+
+# --------------------------------------------------------------------------- #
+# cropping long proteins
+# --------------------------------------------------------------------------- #
+
+
+def _long_chain(n: int, acc: str = "Q12345") -> Chain:
+    return Chain(
+        accession=acc,
+        seq="ACDEFGHIKL"[: min(10, n)] * (n // 10) + "A" * (n % 10),
+        coords=np.arange(n * 9, dtype=np.float32).reshape(n, 3, 3),
+        plddt=np.full(n, 95.0, dtype=np.float32),
+    )
+
+
+def test_long_proteins_are_cropped_not_dropped() -> None:
+    """Field convention: ESM-2 and AlphaFold2 crop; dropping skews the corpus.
+
+    At a 512 window, rejecting long proteins discards ~19% of Swiss-Prot and
+    most multi-domain architectures.
+    """
+    from scripts.fetch_afdb import crop_chain
+
+    chain = _long_chain(1200)
+    cropped = crop_chain(chain, 512)
+    assert len(cropped.seq) == 512
+    assert cropped.coords.shape == (512, 3, 3)
+    assert cropped.plddt.shape == (512,)
+    assert cropped.orig_len == 1200
+    assert cropped.was_cropped
+
+
+def test_crop_is_deterministic_per_accession() -> None:
+    """Re-running must reproduce the same window without threading an RNG."""
+    from scripts.fetch_afdb import crop_chain
+
+    chain = _long_chain(2000, acc="P99999")
+    a, b = crop_chain(chain, 512), crop_chain(chain, 512)
+    assert a.crop_start == b.crop_start
+    assert a.seq == b.seq
+    # different accessions should not all land on the same offset
+    starts = {crop_chain(_long_chain(2000, acc=f"P{i:05d}"), 512).crop_start for i in range(20)}
+    assert len(starts) > 5, "crop offsets are not varying across proteins"
+
+
+def test_crop_keeps_sequence_coords_and_plddt_aligned() -> None:
+    """The three arrays must slice together, or residues get the wrong geometry."""
+    from scripts.fetch_afdb import crop_chain
+
+    chain = _long_chain(900)
+    cropped = crop_chain(chain, 256)
+    s = cropped.crop_start
+    assert cropped.seq == chain.seq[s : s + 256]
+    assert np.array_equal(cropped.coords, chain.coords[s : s + 256])
+    assert np.array_equal(cropped.plddt, chain.plddt[s : s + 256])
+
+
+def test_short_chains_pass_through_untouched() -> None:
+    from scripts.fetch_afdb import crop_chain
+
+    chain = _long_chain(300)
+    assert crop_chain(chain, 512) is chain
+    assert not chain.was_cropped
+
+
+def test_plddt_is_judged_on_the_kept_window() -> None:
+    """A crop is filtered on the residues that actually enter the corpus."""
+    from scripts.fetch_afdb import crop_chain, keep
+
+    chain = _long_chain(1000)
+    chain.plddt[:] = 30.0           # whole protein disordered
+    chain.plddt[400:912] = 95.0     # one well-ordered stretch
+    cropped = crop_chain(chain, 512)
+    assert keep(cropped, 40, 512, 70.0) == (cropped.mean_plddt >= 70.0)
