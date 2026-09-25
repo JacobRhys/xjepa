@@ -1,6 +1,6 @@
 # Cross-Modal JEPA for Protein Sequences — Costed Research Plan (≤ £10 compute)
 
-**Version:** 1.0 · 23 September 2026
+**Version:** 2.0 · 25 September 2026 — pilot measured, corpus building
 **Constraint:** total compute spend < £10 (≈ $12.60 @ 1.26 USD/GBP)
 **Deliverable:** 5-condition controlled pretraining study + probe suite, 3 seeds, reproducible on one consumer GPU.
 
@@ -21,6 +21,59 @@ by cutting three axes that do not change what the experiment tests:
 
 **Costed total: ≈ $7.60 (≈ £6.05)**, leaving ~£4 headroom for reruns. A £0 fallback (Kaggle/Colab free tiers)
 is specified in §7.
+
+### Decisions settled by measurement (25 Sept)
+
+The pilot replaced every modelled figure with a measured one on an RTX 4090
+(torch 2.8, CUDA 12.8). `runs/pilot/pilot.md` has the raw report.
+
+| decision | chosen | why |
+|---|---|---|
+| Attention heads | **8** (head_dim 40) | 1.24x throughput; attention params are `d_model x d_model` so the parameter count and the cross-condition control are unchanged |
+| Bucket policy | **hybrid** | flash is worth only 1.049x once head_dim is 40 -- not enough to justify the crop policy's short-tail problem |
+| Mask rate | **0.20** | matches Ofer et al. |
+| Corruption | **80/10/10 on every masked condition** | see below -- this was a confound |
+| Length floor | **40** | keeping small proteins; see below |
+| Long proteins | **cropped into a 512 window**, not rejected | field convention; see below |
+| Context length | **512** (theirs: 1024) | budget constraint, stated as a deviation |
+
+**Measured throughput:** 770k tok/s at best, 20.2-26.2% MFU, **0 host-to-device
+bytes per step and 0 implicit syncs** -- the residency claim is now measured
+rather than argued. Study cost **£6.32** of £10.
+
+**The headline 1.30x was two effects, and reporting it as one was misleading.**
+Decomposed: head count contributes 1.24x, flash 1.049x at head_dim 40 (1.207x at
+head_dim 16). An early draft of this plan traded away 17.6% of the proteome for
+what was actually a 5% gain.
+
+### A confound found by matching Ofer et al.
+
+Their spec applies 80/10/10 replacement inside the masked subset on the latent
+path as well as the MLM path. Our implementation had used 80/10/10 for MLM
+conditions and all-`<mask>` for latent ones -- so **C1 and C3 differed in their
+inputs as well as their objectives**, and any downstream gap could have come from
+the input distribution rather than the objective. That is precisely the
+comparison H2 rests on. Every masked condition now uses 80/10/10.
+
+### Corpus length policy
+
+Both ends of the length distribution were nearly discarded, for a total of over
+a third of Swiss-Prot:
+
+| band | count | share | status |
+|---|--:|--:|---|
+| < 128 residues | 81,121 | 17.6% | **kept** -- disulphide scaffolds, zinc fingers, toxins, hormones; and SCOPe eval domains are frequently 50-150 residues, so excluding them creates a train/test length mismatch |
+| > 512 residues | 105,586 | 18.6% | **kept, cropped into a 512 window** -- nearly every multi-domain architecture |
+
+Cropping rather than filtering is the field convention: ESM-2 random-crops to its
+context window, AlphaFold2 trains on 256-residue crops and still folds large
+proteins at inference. Protein length is long-tailed, so filtering on it yields a
+corpus skewed toward single-domain chains rather than a smaller unbiased one.
+
+*What is lost:* contacts reaching outside a crop window are invisible to the
+sequence encoder. *What is not:* ESM-IF1 computes its targets from the complete
+structure, so a cropped window still carries targets encoding the whole fold's
+environment.
 
 ---
 
