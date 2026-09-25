@@ -523,3 +523,68 @@ def test_batches_stay_on_corpus_device() -> None:
     batch = next(iter(batcher))
     for t in (batch.tokens, batch.targets, batch.pad_mask, batch.mask_sel, batch.labels):
         assert t.device == corpus.device
+
+
+# --------------------------------------------------------------------------- #
+# torch_scatter shim
+# --------------------------------------------------------------------------- #
+
+
+def test_scatter_shim_matches_reference_semantics() -> None:
+    """The shim stands in for a compiled extension, so verify it numerically.
+
+    ESM-IF1 uses exactly two torch_scatter functions. If these are subtly wrong
+    the structure targets are wrong, and nothing downstream would notice.
+    """
+    import torch
+
+    from xjepa.data.scatter_shim import scatter, scatter_add
+
+    torch.manual_seed(0)
+    src = torch.randn(10, 4)
+    index = torch.tensor([0, 1, 0, 2, 1, 2, 0, 3, 3, 1])
+
+    # sum, against an explicit loop
+    got = scatter_add(src, index, dim=0, dim_size=4)
+    want = torch.zeros(4, 4)
+    for i, g in enumerate(index.tolist()):
+        want[g] += src[i]
+    torch.testing.assert_close(got, want)
+    torch.testing.assert_close(scatter(src, index, dim=0, dim_size=4, reduce="sum"), want)
+
+    # mean
+    counts = torch.bincount(index, minlength=4).clamp_min(1).unsqueeze(-1).float()
+    torch.testing.assert_close(
+        scatter(src, index, dim=0, dim_size=4, reduce="mean"), want / counts
+    )
+
+    # max / min per group
+    want_max = torch.full((4, 4), float("-inf"))
+    for i, g in enumerate(index.tolist()):
+        want_max[g] = torch.maximum(want_max[g], src[i])
+    torch.testing.assert_close(scatter(src, index, dim=0, dim_size=4, reduce="max"), want_max)
+
+
+def test_scatter_shim_empty_slots_are_zero_not_inf() -> None:
+    """torch_scatter returns 0 for groups nothing scattered into, not +/-inf."""
+    import torch
+
+    from xjepa.data.scatter_shim import scatter
+
+    src = torch.randn(3, 2)
+    index = torch.tensor([0, 0, 0])
+    out = scatter(src, index, dim=0, dim_size=3, reduce="max")
+    assert torch.isfinite(out).all()
+    assert (out[1:] == 0).all()
+
+
+def test_scatter_shim_defers_to_the_real_package() -> None:
+    """A genuine compiled torch_scatter must always win over the shim."""
+    import sys
+
+    from xjepa.data.scatter_shim import install, is_real_package_available
+
+    mode = install()
+    assert mode == ("real" if is_real_package_available() else "shim")
+    if mode == "shim":
+        assert sys.modules["torch_scatter"].__xjepa_shim__ is True

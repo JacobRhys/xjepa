@@ -54,6 +54,13 @@ EMBED_DIM = 512
 
 def load_esmif1(device: torch.device):
     """Load the frozen ESM-IF1 model, with actionable guidance if the stack is missing."""
+    # fair-esm's inverse_folding hard-imports the compiled torch_scatter
+    # extension for two functions. Where no wheel exists for this torch+CUDA
+    # pair, fall back to pure-PyTorch equivalents rather than spending 20+
+    # minutes of billed GPU time compiling. A real torch_scatter always wins.
+    from xjepa.data.scatter_shim import install as _install_scatter
+
+    _install_scatter()
     try:
         import esm  # noqa: F401
         import esm.inverse_folding  # noqa: F401
