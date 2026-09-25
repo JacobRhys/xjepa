@@ -66,38 +66,83 @@ SSL_CONTEXT = _ssl_context()
 
 @dataclass(frozen=True)
 class Source:
-    """Where one benchmark comes from and what it is for."""
+    """Where one benchmark comes from and what it is for.
+
+    ``url`` is a direct download; ``hf_repo`` is a HuggingFace dataset. TAPE's
+    own S3 bucket now returns AccessDenied, so the TAPE-derived tasks come from
+    mirrors -- see PROVENANCE below for what was checked before trusting them.
+    """
 
     task: str
     url: str
     homepage: str
     note: str
+    hf_repo: str = ""
+    hf_files: tuple[tuple[str, str], ...] = ()  # (split, filename)
+    provenance: str = ""
 
 
 SOURCES: dict[str, Source] = {
     "ss": Source(
         task="ss",
-        url="http://s3.amazonaws.com/proteindata/data_pytorch/secondary_structure.tar.gz",
+        url="",
+        hf_repo="proteinea/secondary_structure_prediction",
+        hf_files=(("train", "training_hhblits.csv"), ("valid", "TS115.csv"),
+                  ("test", "CB513.csv")),
         homepage="https://github.com/songlab-cal/tape#data",
-        note="TAPE secondary structure (SS3/SS8). Test splits: CB513, TS115, CASP12.",
+        note="TAPE/NetSurfP-2.0 secondary structure. Train: HHblits. Valid: TS115. Test: CB513.",
+        provenance=(
+            "TAPE's S3 bucket returns AccessDenied, so this is the proteinea "
+            "mirror. Verified before use: TS115 has exactly 115 rows as "
+            "published; the column schema is NetSurfP-2.0's own (input, dssp3, "
+            "dssp8, disorder, cb513_mask). CB513 has 511 rows and CASP12 20, "
+            "against the 513/21 usually quoted -- a documented curation "
+            "difference; report the counts actually used."
+        ),
     ),
     "contact": Source(
         task="contact",
-        url="http://s3.amazonaws.com/proteindata/data_pytorch/proteinnet.tar.gz",
+        url="",
+        hf_repo="proteinea/contact_prediction",
+        hf_files=(("archive", "proteinnet.tar.gz"),),
         homepage="https://github.com/songlab-cal/tape#data",
         note="TAPE contact prediction (ProteinNet). Test split: CASP12.",
+        provenance=(
+            "This repo hosts proteinnet.tar.gz -- the *original* TAPE archive "
+            "that the dead S3 bucket served, not a re-derivation. Strongest "
+            "provenance of the mirrored sets."
+        ),
     ),
     "fluorescence": Source(
         task="fluorescence",
-        url="http://s3.amazonaws.com/proteindata/data_pytorch/fluorescence.tar.gz",
+        url="",
+        hf_repo="proteinea/fluorescence",
+        hf_files=(("train", "fluorescence_train.csv"), ("valid", "fluorescence_valid.csv"),
+                  ("test", "fluorescence_test.csv")),
         homepage="https://github.com/songlab-cal/tape#data",
         note="TAPE fluorescence landscape regression (Spearman).",
+        provenance=(
+            "proteinea mirror. Verified: valid split has exactly 5,362 rows as "
+            "published by TAPE, and the columns carry TAPE's own field names "
+            "(primary, log_fluorescence, num_mutations)."
+        ),
     ),
     "stability": Source(
         task="stability",
-        url="http://s3.amazonaws.com/proteindata/data_pytorch/stability.tar.gz",
+        url="",
+        hf_repo="proteinglm/stability_prediction",
+        hf_files=(("train", "data/train-00000-of-00001.parquet"),
+                  ("valid", "data/valid-00000-of-00001.parquet"),
+                  ("test", "data/test-00000-of-00001.parquet")),
         homepage="https://github.com/songlab-cal/tape#data",
         note="TAPE stability regression (Spearman).",
+        provenance=(
+            "NOT a proteinea mirror -- proteinea has no stability set, so this "
+            "is proteinglm's. Verified: valid split has exactly 2,512 rows as "
+            "published by TAPE. Weaker provenance than the others (different "
+            "publisher, reformatted to parquet with columns seq/label); state "
+            "this explicitly in the write-up."
+        ),
     ),
     "scope": Source(
         task="scope",
@@ -107,17 +152,34 @@ SOURCES: dict[str, Source] = {
         ),
         homepage="https://scop.berkeley.edu/astral/ver=2.08",
         note="SCOPe ASTRAL 2.08 40%. Fold + superfamily come from the sccs string.",
+        provenance="Fetched directly from the canonical Berkeley host.",
     ),
     "proteingym": Source(
         task="proteingym",
-        url="",  # intentionally blank: see note
+        url="",
         homepage="https://proteingym.org/download",
         note=(
             "ProteinGym substitution DMS assays. No stable direct URL -- download "
             "the substitutions zip from the homepage and pass --from-local."
         ),
+        provenance="User-supplied download from the official site.",
     ),
 }
+
+
+def hf_fetch(repo: str, filename: str, cache: Path) -> tuple[Path, str]:
+    """Download one file from a HuggingFace dataset, returning it and the repo SHA.
+
+    The commit SHA is the provenance that matters: a mirror can be edited, and
+    recording which revision produced these splits is what makes the run
+    reproducible.
+    """
+    from huggingface_hub import HfApi, hf_hub_download
+
+    sha = HfApi().dataset_info(repo).sha
+    path = hf_hub_download(repo, filename, repo_type="dataset",
+                           local_dir=str(cache / repo.replace("/", "__")))
+    return Path(path), sha
 
 
 def download(url: str, dest: Path, homepage: str) -> Path:
@@ -242,6 +304,95 @@ def read_lmdb(path: Path) -> list[dict]:
             out.append(pickle.loads(txn.get(str(i).encode())))
     env.close()
     return out
+
+
+#: NetSurfP-2.0 label alphabets, in the order TAPE indexes them.
+DSSP3 = "HEC"
+DSSP8 = "GHIBESTC"
+
+
+def convert_ss_csv(files: dict[str, Path], out_dir: Path) -> dict:
+    """NetSurfP-2.0 CSVs -> per-residue SS3 and SS8 label arrays.
+
+    Columns are ``input`` (sequence), ``dssp3``/``dssp8`` (same-length label
+    strings) and ``cb513_mask`` (which positions are scored). Masked-out
+    positions become -100 so the probe ignores them, matching how the benchmark
+    is meant to be evaluated -- scoring them would inflate accuracy on residues
+    the benchmark itself excludes.
+    """
+    import csv as _csv
+
+    meta: dict = {"splits": {}}
+    for split, path in files.items():
+        with open(path, newline="") as fh:
+            rows = list(_csv.DictReader(fh))
+        seqs, ss3, ss8 = [], [], []
+        for r in rows:
+            seq = (r.get("input") or "").strip().upper()
+            d3, d8 = (r.get("dssp3") or ""), (r.get("dssp8") or "")
+            if not seq or len(d3) != len(seq):
+                continue
+            mask = r.get("cb513_mask") or ""
+            keep = [
+                (i < len(mask) and mask[i] not in "0 ") if mask else True
+                for i in range(len(seq))
+            ]
+            seqs.append(seq)
+            ss3.append(np.array(
+                [DSSP3.index(c) if c in DSSP3 and keep[i] else -100
+                 for i, c in enumerate(d3)], dtype=np.int16))
+            ss8.append(np.array(
+                [DSSP8.index(c) if c in DSSP8 and keep[i] else -100
+                 for i, c in enumerate(d8[: len(seq)].ljust(len(seq), "C"))], dtype=np.int16))
+        meta["splits"][split] = write_split(
+            out_dir, split, seqs,
+            ss3=np.concatenate(ss3), ss8=np.concatenate(ss8),
+        )
+        if split == "test":
+            write_fasta(out_dir / "test.fasta", [f"ss_{i}" for i in range(len(seqs))], seqs)
+    return meta
+
+
+def convert_regression_table(files: dict[str, Path], out_dir: Path, task: str) -> dict:
+    """Fluorescence/stability tables (CSV or parquet) -> one scalar per sequence."""
+    seq_cols = ("primary", "seq", "sequence", "mutated_sequence")
+    y_cols = ("log_fluorescence", "stability_score", "label", "target", "score")
+
+    meta: dict = {"splits": {}}
+    for split, path in files.items():
+        if path.suffix == ".parquet":
+            import pandas as pd
+
+            df = pd.read_parquet(path)
+            records = df.to_dict("records")
+        else:
+            import csv as _csv
+
+            with open(path, newline="") as fh:
+                records = list(_csv.DictReader(fh))
+        if not records:
+            continue
+        cols = records[0].keys()
+        sc = next((c for c in seq_cols if c in cols), None)
+        yc = next((c for c in y_cols if c in cols), None)
+        if not (sc and yc):
+            raise ValueError(f"{task}/{split}: no sequence/target column in {list(cols)}")
+
+        seqs, ys = [], []
+        for r in records:
+            seq = str(r[sc]).strip().upper()
+            try:
+                y = float(np.ravel(r[yc])[0]) if not isinstance(r[yc], str) else float(r[yc])
+            except (TypeError, ValueError):
+                continue
+            if seq:
+                seqs.append(seq)
+                ys.append(y)
+        meta["splits"][split] = write_split(
+            out_dir, split, seqs, y=np.asarray(ys, dtype=np.float32))
+        if split == "test":
+            write_fasta(out_dir / "test.fasta", [f"{task}_{i}" for i in range(len(seqs))], seqs)
+    return meta
 
 
 def convert_tape_residue(extracted: Path, out_dir: Path) -> dict:
@@ -438,9 +589,16 @@ def main(argv: list[str] | None = None) -> int:
         print("Evaluation data sources (verify before a long run):\n")
         for s in SOURCES.values():
             print(f"  {s.task}")
-            print(f"    url:      {overrides.get(s.task, s.url) or '(none -- use --from-local)'}")
+            src = overrides.get(s.task) or s.url or (
+                f"hf:{s.hf_repo}" if s.hf_repo else "(none -- use --from-local)")
+            print(f"    source:   {src}")
             print(f"    homepage: {s.homepage}")
-            print(f"    {s.note}\n")
+            print(f"    {s.note}")
+            if s.provenance:
+                import textwrap
+                for line in textwrap.wrap(s.provenance, 74):
+                    print(f"      | {line}")
+            print()
         return 0
 
     if args.from_local and len(args.tasks) != 1:
@@ -459,16 +617,26 @@ def main(argv: list[str] | None = None) -> int:
         out_dir = args.out / task
         print(f"\n[eval] === {task} ===", file=sys.stderr)
 
+        hf_sha = ""
         if args.from_local:
             raw = args.from_local
+            hf_files: dict[str, Path] = {}
+        elif src_def.hf_repo and not overrides.get(task):
+            print(f"[eval] source: {src_def.hf_repo}", file=sys.stderr)
+            hf_files = {}
+            for split, fn in src_def.hf_files:
+                path, hf_sha = hf_fetch(src_def.hf_repo, fn, cache)
+                hf_files[split] = path
+            raw = hf_files.get("archive", Path())
         elif not url:
             print(
-                f"[eval] {task} has no direct URL. Download it from {src_def.homepage} "
+                f"[eval] {task} has no source. Download it from {src_def.homepage} "
                 f"and re-run with --from-local.",
                 file=sys.stderr,
             )
             continue
         else:
+            hf_files = {}
             suffix = ".fa" if url.endswith(".fa") else ".tar.gz" if ".tar" in url else ".bin"
             raw = download(url, cache / f"{task}{suffix}", src_def.homepage)
 
@@ -477,6 +645,10 @@ def main(argv: list[str] | None = None) -> int:
                 meta = convert_scope(raw, out_dir)
             elif task == "proteingym":
                 meta = convert_proteingym(raw, out_dir, args.max_assays, args.max_len)
+            elif task == "ss" and hf_files:
+                meta = convert_ss_csv(hf_files, out_dir)
+            elif task in ("fluorescence", "stability") and hf_files:
+                meta = convert_regression_table(hf_files, out_dir, task)
             else:
                 extracted = cache / f"{task}_x"
                 if raw.is_dir():
@@ -485,9 +657,7 @@ def main(argv: list[str] | None = None) -> int:
                     extracted.mkdir(parents=True, exist_ok=True)
                     with tarfile.open(raw) as tf:
                         tf.extractall(extracted, filter="data")
-                if task == "ss":
-                    meta = convert_tape_residue(extracted, out_dir)
-                elif task == "contact":
+                if task in ("ss", "contact"):
                     meta = convert_tape_residue(extracted, out_dir)
                 else:
                     meta = convert_tape_regression(
@@ -499,7 +669,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:  # noqa: BLE001
             print(
                 f"[eval] conversion failed for {task}: {type(exc).__name__}: {exc}\n"
-                f"[eval] The archive layout may have changed; check {src_def.homepage}.",
+                f"[eval] The source layout may have changed; check {src_def.homepage}.",
                 file=sys.stderr,
             )
             continue
@@ -507,8 +677,15 @@ def main(argv: list[str] | None = None) -> int:
         meta.update({
             "task": task,
             "source_url": url or "local",
+            "hf_repo": src_def.hf_repo or None,
+            # The commit SHA is the reproducibility anchor: a mirror can be
+            # edited, and this records exactly which revision produced these
+            # splits.
+            "hf_revision": hf_sha or None,
+            "hf_files": [fn for _, fn in src_def.hf_files] or None,
             "homepage": src_def.homepage,
             "note": src_def.note,
+            "provenance": src_def.provenance,
             "converted": date.today().isoformat(),
         })
         out_dir.mkdir(parents=True, exist_ok=True)
