@@ -15,3 +15,8 @@ venv/
 *.npy
 *.safetensors
 *.pdb
+
+# secrets -- never commit tokens or API keys
+.env
+*.env
+.xjepa_env
