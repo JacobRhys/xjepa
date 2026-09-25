@@ -24,12 +24,12 @@ corpus_path: data/corpus
 target_dim: 128
 tokens_per_step: 65536
 buckets: [128, 256, 384, 512]
-mask_rate: 0.15
+mask_rate: 0.20        # Ofer et al. use 20%, not ESM-2's 15%
 
 # --- model: ESM-2 t6 8M config, random init (RESEARCH_PLAN.md 3.1) ----------
 n_layers: 6
 d_model: 320
-n_heads: 20
+n_heads: 8          # pilot: 1.24x over 20 heads, identical param count
 d_ff: 1280
 vocab: 33
 max_len: 512

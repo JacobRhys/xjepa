@@ -97,7 +97,7 @@ class RunConfig:
     tie_mlm_weights: bool = True
     tokens_per_step: int = 65_536
     buckets: tuple[int, ...] = (128, 256, 384, 512)
-    mask_rate: float = 0.15
+    mask_rate: float = 0.20
     #: "random" (15% per residue, ESM-2) or "span" (geometric, mean 8) -- the
     #: masking ablation of RESEARCH_PLAN.md sec. 4, run on C3 only.
     mask_mode: str = "random"
@@ -110,7 +110,7 @@ class RunConfig:
     # --- model ----------------------------------------------------------- #
     n_layers: int = 6
     d_model: int = 320
-    n_heads: int = 20
+    n_heads: int = 8
     d_ff: int = 1280
     vocab: int = 33
     max_len: int = 512
@@ -949,12 +949,11 @@ def build_batches(cfg: RunConfig, objective: Objective | None = None):
     Per the contract there is no ``DataLoader``: the corpus lives in VRAM and
     batching is index arithmetic on device.
 
-    The corruption scheme follows the objective rather than the config, because
-    it is not a free parameter: MLM conditions need ESM-2's 80/10/10, latent
-    conditions need every masked position replaced by ``<mask>``, and the
-    unmasked controls (C5, C5c) need no masker at all -- with ``masker=None``
-    the batcher emits all-false ``mask_sel`` and all ``-100`` labels, so
-    ``original_tokens`` recovers the clean sequence.
+    Every masked condition uses the same ESM-2 80/10/10 corruption, so the only
+    thing that differs between conditions is the objective. The unmasked controls
+    (C5, C5c) need no masker at all -- with ``masker=None`` the batcher emits
+    all-false ``mask_sel`` and all ``-100`` labels, so ``original_tokens``
+    recovers the clean sequence.
 
     Args:
         cfg: Run config.
@@ -973,7 +972,12 @@ def build_batches(cfg: RunConfig, objective: Objective | None = None):
 
     masker = None
     if objective is None or objective.uses_masking:
-        corruption = "mlm" if (objective is not None and objective.needs_mlm_head) else "jepa"
+        # ESM-2's 80/10/10 for EVERY masked condition, not just the MLM ones.
+        # Using all-<mask> for the latent objectives would mean C1 and C3 differ
+        # in their *inputs* as well as their objectives, confounding exactly the
+        # comparison the study exists to make. Ofer et al. apply 80/10/10 inside
+        # their masked subset too, so this also matches the work being replicated.
+        corruption = "mlm"
         masker = Masker(
             MaskingConfig(
                 mode=cfg.mask_mode,

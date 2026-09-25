@@ -206,8 +206,14 @@ def test_build_batches_wires_to_the_real_batcher(tmp_path, name: str) -> None:
         assert (batch.labels == -100).all()
 
 
-def test_build_batches_corruption_follows_the_objective(tmp_path) -> None:
-    """MLM conditions get 80/10/10; latent conditions get pure <mask>."""
+def test_build_batches_corruption_is_identical_across_conditions(tmp_path) -> None:
+    """Every masked condition must corrupt inputs the same way.
+
+    If the latent objectives used all-<mask> while MLM used 80/10/10, C1 and C3
+    would differ in their *inputs* as well as their objectives -- confounding the
+    exact comparison the study exists to make. Ofer et al. apply 80/10/10 inside
+    their masked subset too.
+    """
     from xjepa.data.masking import MASK_ID
     from xjepa.train.trainer import build_batches
 
@@ -219,9 +225,17 @@ def test_build_batches_corruption_follows_the_objective(tmp_path) -> None:
         cfg.buckets, cfg.tokens_per_step = (32, 64), 512
         return next(iter(build_batches(cfg, build_objective(cfg.objective))[1]))
 
-    jepa = batch_for("c3_jepa_frozen")
-    assert (jepa.tokens[jepa.mask_sel] == MASK_ID).all(), "JEPA must mask every selected position"
+    def mask_fraction(b) -> float:
+        sel = b.tokens[b.mask_sel]
+        return float((sel == MASK_ID).float().mean())
 
-    mlm = batch_for("c1_mlm")
-    masked_inputs = mlm.tokens[mlm.mask_sel]
-    assert (masked_inputs != MASK_ID).any(), "MLM should leave ~20% un-masked (80/10/10)"
+    jepa = mask_fraction(batch_for("c3_jepa_frozen"))
+    mlm = mask_fraction(batch_for("c1_mlm"))
+
+    # 80/10/10 on both paths: ~80% of selected positions carry <mask>
+    for name, frac in (("c3_jepa_frozen", jepa), ("c1_mlm", mlm)):
+        assert 0.6 < frac < 0.95, f"{name}: {frac:.2f} of masked positions are <mask>, want ~0.8"
+    assert abs(jepa - mlm) < 0.15, (
+        f"corruption differs between conditions ({jepa:.2f} vs {mlm:.2f}) -- "
+        "that is a confound, not a design choice"
+    )
