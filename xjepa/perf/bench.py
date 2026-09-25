@@ -810,9 +810,17 @@ def run_benchmark(cfg: BenchConfig, verbose: bool = True) -> BenchResult:
             clock.mark()
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
             pred = step_model(tokens, pad_mask, mask_sel)
-            loss = F.smooth_l1_loss(
-                pred.float()[mask_sel], targets.float()[mask_sel], beta=1.0
+            # Fixed-shape weighted mean, NOT `pred[mask_sel]`. Boolean mask
+            # indexing has a data-dependent output shape, so it forces a device
+            # sync every step -- which would make this harness report syncs that
+            # the real training loop does not have, and measure a step time the
+            # real loop never pays. `xjepa.train.objectives` uses this same form
+            # for the same reason.
+            w = mask_sel.to(pred.dtype).unsqueeze(-1)
+            per_pos = F.smooth_l1_loss(
+                pred.float(), targets.float(), beta=1.0, reduction="none"
             )
+            loss = (per_pos * w).sum() / w.sum().clamp_min(1.0)
         if timed:
             clock.mark()
         loss.backward()
