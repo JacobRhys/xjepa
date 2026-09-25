@@ -34,6 +34,7 @@ import argparse
 import json
 import sys
 import shutil
+import ssl
 import tarfile
 import urllib.error
 import urllib.request
@@ -48,6 +49,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from xjepa.data.alphabet import encode_many
 
 USER_AGENT = "xjepa-research/0.1 (academic study)"
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """Verified TLS that works on a python.org macOS build (see fetch_afdb.py)."""
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
+SSL_CONTEXT = _ssl_context()
 
 
 @dataclass(frozen=True)
@@ -115,7 +129,7 @@ def download(url: str, dest: Path, homepage: str) -> Path:
     print(f"[eval] downloading {url}", file=sys.stderr)
     try:
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=300) as resp, open(dest, "wb") as fh:
+        with urllib.request.urlopen(req, timeout=300, context=SSL_CONTEXT) as resp, open(dest, "wb") as fh:
             while chunk := resp.read(1 << 20):
                 fh.write(chunk)
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as exc:
