@@ -40,6 +40,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import re
+import ssl
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,8 +54,62 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from xjepa.data.alphabet import THREE_TO_ONE
 
+def _ssl_context() -> "ssl.SSLContext":
+    """A verified TLS context that works on a python.org macOS build.
+
+    Those builds do not read the system keychain, so ``urlopen`` fails with
+    ``CERTIFICATE_VERIFY_FAILED`` unless "Install Certificates.command" has been
+    run. Pointing at certifi's bundle works everywhere without asking the user
+    to run anything, and -- unlike disabling verification -- keeps the
+    connections authenticated.
+    """
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
+SSL_CONTEXT = _ssl_context()
+
 AFDB_URL = "https://alphafold.ebi.ac.uk/files/AF-{acc}-F1-model_v{ver}.pdb"
+AFDB_API = "https://alphafold.ebi.ac.uk/api/prediction/{acc}"
 UNIPROT_SEARCH = "https://rest.uniprot.org/uniprotkb/search"
+
+#: AFDB bumps its model version periodically (v4 in 2024, v6 by late 2026) and
+#: retires the old file paths, so a hardcoded version silently turns every fetch
+#: into a 404 -- indistinguishable from "no model for this accession". Default to
+#: the current one, but discover the real version from the API the first time a
+#: fetch 404s, so a future bump costs one extra request rather than a failed run.
+DEFAULT_MODEL_VERSION = 6
+_discovered_version: int | None = None
+_discovery_lock = threading.Lock()
+
+
+def discover_model_version(accession: str) -> int | None:
+    """Ask the AFDB API which model version it currently serves.
+
+    Args:
+        accession: Any accession AFDB has a model for.
+
+    Returns:
+        The version integer parsed out of the API's ``pdbUrl``, or ``None`` if
+        the API is unreachable or its response does not match expectations.
+    """
+    try:
+        req = urllib.request.Request(
+            AFDB_API.format(acc=accession), headers={"User-Agent": USER_AGENT}
+        )
+        with urllib.request.urlopen(req, timeout=30, context=SSL_CONTEXT) as resp:
+            payload = json.loads(resp.read())
+    except Exception:  # noqa: BLE001 - discovery is best effort
+        return None
+
+    entry = payload[0] if isinstance(payload, list) and payload else payload
+    url = entry.get("pdbUrl", "") if isinstance(entry, dict) else ""
+    match = re.search(r"model_v(\d+)\.pdb", url)
+    return int(match.group(1)) if match else None
 USER_AGENT = "xjepa-research/0.1 (academic study; contact via repository)"
 
 BACKBONE_ATOMS = ("N", "CA", "C")
@@ -104,7 +161,7 @@ def uniprot_accessions(target: int, min_len: int, max_len: int) -> Iterator[str]
     seen = 0
     while url and seen < target:
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=60, context=SSL_CONTEXT) as resp:
             body = resp.read().decode("utf-8")
             link = resp.headers.get("Link", "")
         for acc in body.split():
@@ -129,14 +186,33 @@ def fetch_pdb(accession: str, version: int, retries: int, backoff: float) -> str
     fraction of any accession list and is not an error. Other failures are
     retried with exponential backoff.
     """
+    global _discovered_version
+    with _discovery_lock:
+        if _discovered_version is not None:
+            version = _discovered_version
     url = AFDB_URL.format(acc=accession, ver=version)
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with urllib.request.urlopen(req, timeout=60, context=SSL_CONTEXT) as resp:
                 return resp.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
+                # Could be "no model for this accession", or could be that AFDB
+                # has bumped its version and every path is stale. Ask once.
+                with _discovery_lock:
+                    if _discovered_version is None:
+                        found = discover_model_version(accession)
+                        _discovered_version = found if found is not None else version
+                        if found is not None and found != version:
+                            print(
+                                f"[fetch] AFDB now serves model_v{found}, not "
+                                f"v{version}; switching.",
+                                file=sys.stderr,
+                            )
+                            version = found
+                            url = AFDB_URL.format(acc=accession, ver=version)
+                            continue
                 return None
             if exc.code in (429, 500, 502, 503, 504) and attempt < retries - 1:
                 time.sleep(backoff * (2**attempt))
@@ -283,7 +359,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--shard-size", type=int, default=2000)
     p.add_argument("--workers", type=int, default=8,
                    help="concurrent downloads; be polite to a public service")
-    p.add_argument("--model-version", type=int, default=4)
+    p.add_argument("--model-version", type=int, default=DEFAULT_MODEL_VERSION,
+                   help="AFDB model version; auto-corrected from their API on a 404")
     p.add_argument("--retries", type=int, default=4)
     p.add_argument("--backoff", type=float, default=1.0)
     p.add_argument("--overwrite", action="store_true")
