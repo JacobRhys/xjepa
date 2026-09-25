@@ -39,6 +39,7 @@ import sys
 import time
 import urllib.error
 import urllib.parse
+import http.client
 import urllib.request
 import re
 import ssl
@@ -270,7 +271,13 @@ def fetch_pdb(accession: str, version: int, retries: int, backoff: float) -> str
                 time.sleep(backoff * (2**attempt))
                 continue
             return None
-        except (urllib.error.URLError, TimeoutError, OSError):
+        except (
+            urllib.error.URLError,
+            http.client.HTTPException,  # IncompleteRead, RemoteDisconnected, ...
+            TimeoutError,
+            OSError,
+            ValueError,  # malformed chunked encoding surfaces here
+        ):
             if attempt < retries - 1:
                 time.sleep(backoff * (2**attempt))
                 continue
@@ -470,6 +477,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--retries", type=int, default=4)
     p.add_argument("--backoff", type=float, default=1.0)
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--skip", type=int, default=0,
+                   help="skip the first N accessions -- UniProt paging is "
+                        "deterministic, so this resumes where a killed run left off")
+    p.add_argument("--start-shard", type=int, default=0,
+                   help="number the first new shard from here, so a resumed run "
+                        "does not overwrite shards already uploaded")
     p.add_argument("--push-to", default=None, metavar="REPO",
                    help="HuggingFace dataset to stream shards into (e.g. user/xjepa). "
                         "Each shard is uploaded then deleted locally, capping peak "
@@ -487,6 +500,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.overwrite and fasta.exists():
         fasta.unlink()
 
+    def _skip(it: Iterable[str], n: int) -> Iterator[str]:
+        """Drop the first ``n`` accessions from a deterministic stream."""
+        for i, acc in enumerate(it):
+            if i >= n:
+                yield acc
+
     if args.accessions:
         accessions: Iterable[str] = read_accessions(args.accessions)
     else:
@@ -498,19 +517,31 @@ def main(argv: list[str] | None = None) -> int:
             max_len=args.max_len if args.no_crop_long else None,
         )
 
+    if args.skip:
+        print(f"[fetch] resuming: skipping the first {args.skip:,} accessions",
+              file=sys.stderr)
+        accessions = _skip(accessions, args.skip)
+
     kept: list[Chain] = []
-    shard_idx = 0
+    shard_idx = args.start_shard
     n_kept = n_seen = n_missing = n_filtered = n_cropped = 0
     t0 = time.time()
 
     def work(acc: str) -> Chain | None:
-        text = fetch_pdb(acc, args.model_version, args.retries, args.backoff)
-        if text is None:
+        try:
+            text = fetch_pdb(acc, args.model_version, args.retries, args.backoff)
+            if text is None:
+                return None
+            chain = parse_backbone(text, acc)
+            if chain is None or args.no_crop_long:
+                return chain
+            return crop_chain(chain, args.max_len)
+        except Exception as exc:  # noqa: BLE001
+            # ThreadPoolExecutor.map re-raises in the consumer, so an escaped
+            # exception here aborts the entire download. One bad protein must
+            # never cost tens of thousands of good ones.
+            print(f"[fetch] skipped {acc}: {type(exc).__name__}: {exc}", file=sys.stderr)
             return None
-        chain = parse_backbone(text, acc)
-        if chain is None or args.no_crop_long:
-            return chain
-        return crop_chain(chain, args.max_len)
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         for chain in pool.map(work, accessions):
@@ -531,6 +562,14 @@ def main(argv: list[str] | None = None) -> int:
                     write_fasta(fasta, kept)
                     if pusher:
                         pusher.push(path, delete_local=not args.keep_local)
+                    # Record where we are, so a crash can resume without
+                    # re-fetching everything.
+                    (args.out / "progress.json").write_text(
+                        json.dumps({
+                            "accessions_consumed": args.skip + n_seen,
+                            "next_shard": shard_idx + 1,
+                            "kept": n_kept,
+                        }, indent=2), encoding="utf-8")
                 shard_idx += 1
                 kept = []
 
