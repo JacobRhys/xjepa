@@ -26,11 +26,17 @@ Then::
         --tokens data/raw/tokens.npy --offsets data/raw/offsets.npy \\
         --out data/corpus --dim 128
 
-**Install warning.** ESM-IF1 needs ``fair-esm`` plus ``torch-geometric``,
-``torch-scatter``, ``torch-sparse`` and ``biotite``. That stack is genuinely
-version-sensitive and can eat a day. ``scripts/extract_3di.py`` is the CPU-only
-fallback target and is worth building regardless, as a check that results are
-not an ESM-IF1 artefact.
+**Install.** Verified working on a RunPod PyTorch 2.8.0 + CUDA 12.8 image::
+
+    pip install fair-esm biotite torch_geometric
+    pip install torch-scatter -f https://data.pyg.org/whl/torch-2.8.0+cu128.html
+
+Run ``scripts/check_esmif1.py`` first on any new machine -- it checks the
+imports and the residue alignment before an extraction is paid for.
+``xjepa.data.esmif1_compat`` patches fair-esm's two import-time incompatibilities
+with a modern stack, so no version pinning is needed. ``scripts/extract_3di.py``
+remains the CPU-only fallback target and is worth building regardless, as a
+check that results are not an ESM-IF1 artefact.
 """
 
 from __future__ import annotations
@@ -54,13 +60,13 @@ EMBED_DIM = 512
 
 def load_esmif1(device: torch.device):
     """Load the frozen ESM-IF1 model, with actionable guidance if the stack is missing."""
-    # fair-esm's inverse_folding hard-imports the compiled torch_scatter
-    # extension for two functions. Where no wheel exists for this torch+CUDA
-    # pair, fall back to pure-PyTorch equivalents rather than spending 20+
-    # minutes of billed GPU time compiling. A real torch_scatter always wins.
-    from xjepa.data.scatter_shim import install as _install_scatter
+    # fair-esm 2.0.0 has two import-time incompatibilities with a modern
+    # scientific-Python stack (torch_scatter, biotite.filter_backbone). Both are
+    # patched in place; see xjepa.data.esmif1_compat for why pinning biotite
+    # instead cascades into a broken numpy/scipy.
+    from xjepa.data.esmif1_compat import prepare
 
-    _install_scatter()
+    prepare()
     try:
         import esm  # noqa: F401
         import esm.inverse_folding  # noqa: F401

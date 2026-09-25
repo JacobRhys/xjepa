@@ -52,13 +52,16 @@ def ideal_helix(length: int) -> np.ndarray:
 
 def check_imports() -> int:
     """Check the dependency stack, installing the scatter shim if needed."""
-    from xjepa.data.scatter_shim import install, is_real_package_available
+    from xjepa.data.esmif1_compat import prepare
+    from xjepa.data.scatter_shim import is_real_package_available
 
     real = is_real_package_available()
-    mode = install()
+    state = prepare()
+    mode = state["torch_scatter"]
     print(f"torch            {torch.__version__} (cuda {torch.version.cuda})")
     print(f"torch_scatter    {'real compiled wheel' if real else 'MISSING -> using shim'}")
     print(f"scatter backend  {mode}")
+    print(f"biotite compat   {state['biotite.filter_backbone']}")
 
     try:
         import torch_geometric
