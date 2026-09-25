@@ -12,6 +12,15 @@ dependencies = [
   "scikit-learn>=1.4",
 ]
 
+# Without this, setuptools' flat-layout auto-discovery sees `configs/`,
+# `scripts/` and `tests/` alongside `xjepa/` and refuses to build:
+#   "Multiple top-level packages discovered in a flat-layout".
+# Older setuptools tolerated it; 78+ does not, so a fresh machine fails where a
+# stale one succeeds. Only `xjepa` is the library; scripts and tests are run
+# from the repo root.
+[tool.setuptools.packages.find]
+include = ["xjepa*"]
+
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-timeout>=2.2"]
 
