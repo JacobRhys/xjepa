@@ -325,6 +325,49 @@ def write_shard(path: Path, chains: list[Chain]) -> None:
     tmp.replace(path)
 
 
+class ShardPusher:
+    """Upload each finished shard to a HuggingFace dataset, then delete it locally.
+
+    Written for a machine with almost no free disk. The download itself never
+    touches disk -- each PDB is parsed in memory and discarded -- but the shards
+    would still accumulate to ~0.5 GB. Pushing and unlinking as we go caps peak
+    local usage at a single shard (~24 MB).
+
+    A failed upload keeps the shard on disk rather than deleting it, so a network
+    blip costs bandwidth to redo rather than losing an hour of fetching.
+    """
+
+    def __init__(self, repo: str, prefix: str = "data/structures", token: str | None = None):
+        from huggingface_hub import HfApi
+
+        self.repo = repo
+        self.prefix = prefix.strip("/")
+        self.api = HfApi(token=token)
+        self.pushed = 0
+        self.failed: list[str] = []
+        self.api.create_repo(repo, repo_type="dataset", private=True, exist_ok=True)
+
+    def push(self, path: Path, delete_local: bool = True) -> bool:
+        """Upload one file. Returns True on success."""
+        try:
+            self.api.upload_file(
+                path_or_fileobj=str(path),
+                path_in_repo=f"{self.prefix}/{path.name}",
+                repo_id=self.repo,
+                repo_type="dataset",
+            )
+        except Exception as exc:  # noqa: BLE001 - never lose data to an upload error
+            print(f"[fetch] upload FAILED for {path.name}: {exc}", file=sys.stderr)
+            print("[fetch] keeping it on disk; re-run with --overwrite to retry",
+                  file=sys.stderr)
+            self.failed.append(path.name)
+            return False
+        self.pushed += 1
+        if delete_local:
+            path.unlink(missing_ok=True)
+        return True
+
+
 def write_fasta(path: Path, chains: Iterable[Chain]) -> int:
     """Append chains to a FASTA, for MMseqs2 in the next step."""
     n = 0
@@ -364,9 +407,19 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--retries", type=int, default=4)
     p.add_argument("--backoff", type=float, default=1.0)
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--push-to", default=None, metavar="REPO",
+                   help="HuggingFace dataset to stream shards into (e.g. user/xjepa). "
+                        "Each shard is uploaded then deleted locally, capping peak "
+                        "disk use at one shard -- for machines short on space.")
+    p.add_argument("--keep-local", action="store_true",
+                   help="with --push-to, upload but do not delete the local shard")
     args = p.parse_args(argv)
 
     args.out.mkdir(parents=True, exist_ok=True)
+    pusher = ShardPusher(args.push_to) if args.push_to else None
+    if pusher:
+        print(f"[fetch] streaming shards to {args.push_to} (peak local disk: one shard)",
+              file=sys.stderr)
     fasta = args.out / "sequences.fasta"
     if args.overwrite and fasta.exists():
         fasta.unlink()
@@ -408,6 +461,8 @@ def main(argv: list[str] | None = None) -> int:
                 if args.overwrite or not path.exists():
                     write_shard(path, kept)
                     write_fasta(fasta, kept)
+                    if pusher:
+                        pusher.push(path, delete_local=not args.keep_local)
                 shard_idx += 1
                 kept = []
 
@@ -425,6 +480,8 @@ def main(argv: list[str] | None = None) -> int:
         path = args.out / f"shard_{shard_idx:04d}.npz"
         write_shard(path, kept)
         write_fasta(fasta, kept)
+        if pusher:
+            pusher.push(path, delete_local=not args.keep_local)
         shard_idx += 1
 
     meta = {
@@ -441,7 +498,18 @@ def main(argv: list[str] | None = None) -> int:
         "afdb_model_version": args.model_version,
         "source": "uniprot-reviewed" if args.from_uniprot else str(args.accessions),
     }
+    if pusher:
+        meta["pushed_shards"] = pusher.pushed
+        meta["failed_uploads"] = pusher.failed
     (args.out / "fetch_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    if pusher:
+        # The FASTA and metadata are small and needed by the next step.
+        pusher.push(fasta, delete_local=False)
+        pusher.push(args.out / "fetch_meta.json", delete_local=False)
+        print(f"[fetch] uploaded {pusher.pushed} files to {args.push_to}", file=sys.stderr)
+        if pusher.failed:
+            print(f"[fetch] {len(pusher.failed)} uploads FAILED: {pusher.failed}",
+                  file=sys.stderr)
 
     print(
         f"\n[fetch] kept {n_kept:,} chains in {shard_idx} shards -> {args.out}\n"
