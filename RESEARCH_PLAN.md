@@ -78,6 +78,28 @@ rather than the 17.9% restored before filtering -- short chains are hit harder b
 L0, consistent with SCOPe domains being short. Reported as a deviation; refilling
 it would mean choosing pretraining data by its overlap with the test set.
 
+### Target bank: PCA-256, not 128 (gate 2, 6 Oct)
+
+Measured on the 8.9M-residue bank:
+
+| | explained variance | RankMe (unwhitened) |
+|---|--:|--:|
+| raw ESM-IF1, 512-d | 1.000 | 418.9 / 512 |
+| PCA-128 | 0.720 | 119.4 |
+| PCA-192 | 0.816 | 175.5 |
+| **PCA-256** | **0.879** | **229.8** |
+
+**Gate 2 passes**: ESM-IF1's embeddings have high effective rank (419), so the
+target bank does not cap C3 at a low rank (H1b). But the spectrum is flat, so 128
+components keep only 72% of the variance, below the 85-95% this plan expected.
+§2.2's fallback rule applies: **256-d**, 0.879 variance, 4.24 GiB in VRAM. All
+seven configs change identically, so the cross-condition control holds.
+
+The first build reported RankMe 127.96 / 128. That was measured *after*
+standardisation, which forces RankMe to ~target_dim whatever the data, so the gate
+could not fail. `build_cache` now reports the unwhitened rank as `rankme`, with
+`rankme_source` and `rankme_whitened` alongside.
+
 ### Corpus length policy
 
 Both ends of the length distribution were nearly discarded, for a total of over

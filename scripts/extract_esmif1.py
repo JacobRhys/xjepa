@@ -24,7 +24,7 @@ Then::
 
     python -m xjepa.data.build_cache --embeddings data/raw/esmif1_512.npy \\
         --tokens data/raw/tokens.npy --offsets data/raw/offsets.npy \\
-        --out data/corpus --dim 128
+        --out data/corpus --dim 256
 
 **Install.** Verified working on a RunPod PyTorch 2.8.0 + CUDA 12.8 image::
 
@@ -322,7 +322,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             "[esmif1] Next: python -m xjepa.data.build_cache "
             f"--embeddings {bank_path} --tokens {args.out / 'tokens.npy'} "
-            f"--offsets {args.out / 'offsets.npy'} --out data/corpus --dim 128\n"
+            f"--offsets {args.out / 'offsets.npy'} --out data/corpus --dim 256\n"
             "[esmif1] Record the PCA explained variance AND the bank's RankMe -- "
             "that RankMe is the H1b ceiling and a go/no-go before the grid.",
             file=sys.stderr,

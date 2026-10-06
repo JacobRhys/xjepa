@@ -12,7 +12,7 @@ At our scale this is not an optimisation, it is a structural property:
 |---|---|---|
 | Token ids, 17.0M residues, uint8 | 16.2 MB | GPU |
 | Sequence offsets + lengths, int32 | 0.4 MB | GPU |
-| Target bank, 17.0M x 128, fp16 (PCA-reduced) | 4.05 GiB | GPU |
+| Target bank, 8.9M x 256, fp16 (PCA-reduced) | 4.24 GiB | GPU |
 | Model + optimiser states, 8M params | ~0.2 GB | GPU |
 
 Total ~4.3 GiB on a 24 GB card. MEASURED from the built corpus: 49,000 chains,
@@ -33,7 +33,7 @@ class GpuCorpus:
     """Whole corpus resident on device. Nothing is transferred per step."""
     tokens:  torch.Tensor  # uint8   [total_residues]      device
     offsets: torch.Tensor  # int32   [n_seqs + 1]          device
-    targets: torch.Tensor  # float16 [total_residues, 128] device
+    targets: torch.Tensor  # float16 [total_residues, target_dim] device
     lengths: torch.Tensor  # int32   [n_seqs]              device
 
     @classmethod
@@ -52,7 +52,7 @@ class BucketBatcher:
 @dataclass
 class Batch:
     tokens:  torch.Tensor  # int64   [B, L]   device
-    targets: torch.Tensor  # float16 [B, L, 128]
+    targets: torch.Tensor  # float16 [B, L, target_dim]
     pad_mask: torch.Tensor # bool    [B, L]   True = real residue
     mask_sel: torch.Tensor # bool    [B, L]   True = masked position
     labels:  torch.Tensor  # int64   [B, L]   -100 where not masked
@@ -74,9 +74,9 @@ class Encoder(nn.Module):
 ### xjepa/model/heads.py
 ```python
 class Predictor(nn.Module):   # 2 layers, d=160, 4 heads -> narrow, per I-JEPA
-    def forward(self, h, mask_sel, pad_mask=None) -> torch.Tensor: ...  # [B, L, 128]
+    def forward(self, h, mask_sel, pad_mask=None) -> torch.Tensor: ...  # [B, L, target_dim]
     # pad_mask is keyword-optional but objectives MUST pass it, or the predictor
-    # attends over padding. Output is dense [B, L, 128]; the objective selects
+    # attends over padding. Output is dense [B, L, target_dim]; the objective selects
     # positions. replace_masked=False gives c5c_predictor_nomask directly.
 class MlmHead(nn.Module):
     def forward(self, h) -> torch.Tensor: ...             # [B, L, vocab]

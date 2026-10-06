@@ -21,7 +21,7 @@ seed: 0
 
 # --- data (identical across conditions) ------------------------------------
 corpus_path: data/corpus
-target_dim: 128
+target_dim: 256          # PCA-256: 0.879 variance, RankMe 230 (128 kept 0.720)
 tokens_per_step: 65536
 buckets: [128, 256, 384, 512]
 mask_rate: 0.20        # Ofer et al. use 20%, not ESM-2's 15%

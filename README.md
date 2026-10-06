@@ -28,13 +28,13 @@ Config files differ **only** in their objective block. That diffability is the e
 
 ## Design constraint: the corpus lives in VRAM
 
-The whole training corpus is under 3 GB:
+The whole training corpus is under 5 GB:
 
 | asset | size |
 |---|---|
 | tokens, 10M residues, uint8 | 10 MB |
 | offsets, int32 | 0.3 MB |
-| ESM-IF1 target bank, 10M × 128, fp16 | 2.6 GB |
+| ESM-IF1 target bank, 8.9M × 256, fp16 | 4.6 GB |
 | model + optimiser, 8M params | ~0.2 GB |
 
 So it is loaded to device once and never transferred again. There is no `DataLoader`, no worker
@@ -81,7 +81,7 @@ python scripts/extract_esmif1.py --shards data/structures \
     --allowlist data/splits/pretrain_accessions.txt --out data/raw --limit 500
 python -m xjepa.data.build_cache --embeddings data/raw/esmif1_512.npy \
     --tokens data/raw/tokens.npy --offsets data/raw/offsets.npy \
-    --out data/corpus --dim 128
+    --out data/corpus --dim 256
 python scripts/extract_3di.py --shards data/structures \
     --allowlist data/splits/pretrain_accessions.txt --out data/raw_3di
 

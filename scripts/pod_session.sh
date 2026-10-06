@@ -386,7 +386,7 @@ case "$PHASE" in
       --allowlist data/splits/pretrain_accessions.txt --out data/raw "${EXTRA_ARGS[@]}"
     python -m xjepa.data.build_cache --embeddings data/raw/esmif1_512.npy \
       --tokens data/raw/tokens.npy --offsets data/raw/offsets.npy \
-      --out data/corpus --dim 128
+      --out data/corpus --dim 256
     log "target bank RankMe (the H1b ceiling) is in data/corpus/meta.json -- READ IT."
     log "A low value caps what C3 can learn, and it is a go/no-go before the grid."
     cat data/corpus/meta.json >&2 || true

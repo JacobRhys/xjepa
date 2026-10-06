@@ -265,7 +265,15 @@ def build_cache(
         if rm_rows < int(out.shape[0])
         else np.arange(int(out.shape[0]))
     )
-    rm = rankme(torch.as_tensor(np.array(out[ridx], dtype=np.float32, copy=True)))
+    # RankMe must be read before standardisation. Whitening rescales every
+    # component to unit variance, which drives RankMe to ~target_dim whatever
+    # the embeddings contain -- a gate that cannot fail. The H1b ceiling is the
+    # unwhitened rank of the projected bank; the source rank says how much the
+    # projection itself throws away.
+    whitened = torch.as_tensor(np.array(out[ridx], dtype=np.float32, copy=True))
+    rm_whitened = rankme(whitened)
+    rm = rankme(whitened * fit.scale)
+    rm_source = rankme(torch.as_tensor(np.array(bank[ridx], dtype=np.float32, copy=True)))
 
     _copy_npy(tokens, os.path.join(out_dir, "tokens.npy"))
     _copy_npy(offsets, os.path.join(out_dir, "offsets.npy"))
@@ -283,6 +291,8 @@ def build_cache(
         "explained_variance_ratio": round(fit.explained_variance_ratio, 6),
         "standardised": bool(standardise),
         "rankme": round(rm, 4),
+        "rankme_source": round(rm_source, 4),
+        "rankme_whitened": round(rm_whitened, 4),
         "rankme_rows": rm_rows,
         "target_bank_bytes": int(out.shape[0]) * int(dim) * 2,
         "seed": seed,
@@ -333,7 +343,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         f"explained variance ratio (dim={meta['target_dim']}): "
         f"{meta['explained_variance_ratio']:.4f}"
     )
-    print(f"RankMe(target bank) = {meta['rankme']:.2f} / {meta['target_dim']}")
+    print(f"RankMe(target bank, unwhitened) = {meta['rankme']:.2f} / {meta['target_dim']}"
+          f"   (source {meta['rankme_source']:.1f} / {meta['source_dim']})")
     return 0
 
 
