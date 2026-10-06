@@ -154,7 +154,18 @@ def esmif1_features(split_dir: Path, split: str, mask: torch.Tensor) -> torch.Te
     path = split_dir / f"{split}_esmif1.npy"
     if not path.exists():
         return None
+    meta_path = split_dir / f"{split}_esmif1.json"
+    if meta_path.exists():
+        built_len = json.loads(meta_path.read_text(encoding="utf-8")).get("max_len")
+        if built_len is not None and int(mask.sum(1).max()) > built_len:
+            raise ValueError(
+                f"{path.name} holds the first {built_len} residues per protein, but "
+                f"--max-len asks for more; rebuild it or lower --max-len")
     flat = torch.from_numpy(np.load(path))
+    if flat.shape[0] != int(mask.sum()):
+        raise ValueError(
+            f"{path.name} has {flat.shape[0]} rows for {int(mask.sum())} residues; "
+            "it was built with a different --max-len or split")
     n, L = mask.shape
     out = torch.zeros(n, L, flat.shape[-1], dtype=torch.float16)
     cursor = 0
@@ -163,6 +174,20 @@ def esmif1_features(split_dir: Path, split: str, mask: torch.Tensor) -> torch.Te
         out[i, :ln] = flat[cursor : cursor + ln].to(torch.float16)
         cursor += ln
     return out
+
+
+esmif1_features.per_split = True  # type: ignore[attr-defined]
+
+
+def featurise(featuriser, tokens: torch.Tensor, mask: torch.Tensor, split_dir: Path, split: str):
+    """Call a featuriser, telling the precomputed ones which split this is.
+
+    Encoders featurise from tokens alone. The ESM-IF1 ceiling cannot -- its
+    features come from structures -- so it is looked up by split instead.
+    """
+    if getattr(featuriser, "per_split", False):
+        return featuriser(split_dir, split, mask)
+    return featuriser(tokens, mask)
 
 
 # --------------------------------------------------------------------------- #
@@ -184,7 +209,7 @@ def eval_residue_task(
     parts: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
     for name, split in splits.items():
         tokens, mask = to_padded(split, max_len)
-        feats = featuriser(tokens, mask)
+        feats = featurise(featuriser, tokens, mask, base, name)
         if feats is None:
             return None
         labels = residue_labels(split, label_key, mask)
@@ -213,7 +238,7 @@ def eval_regression_task(
     parts: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
     for name, split in splits.items():
         tokens, mask = to_padded(split, max_len)
-        feats = featuriser(tokens, mask)
+        feats = featurise(featuriser, tokens, mask, base, name)
         if feats is None:
             return None
         parts[name] = (mean_pool(feats.float(), mask), torch.from_numpy(split["y"]).float())
@@ -263,7 +288,7 @@ def eval_contact_task(featuriser, eval_root: Path, device, max_len: int) -> dict
     parts: dict[str, list[ContactExample]] = {}
     for name, split in splits.items():
         tokens, mask = to_padded(split, max_len)
-        feats = featuriser(tokens, mask)
+        feats = featurise(featuriser, tokens, mask, base, name)
         if feats is None:
             return None
         parts[name] = contact_examples(split, feats, mask)
@@ -280,7 +305,7 @@ def eval_fold_retrieval(featuriser, eval_root: Path, max_len: int) -> dict | Non
     if split is None:
         return None
     tokens, mask = to_padded(split, max_len)
-    feats = featuriser(tokens, mask)
+    feats = featurise(featuriser, tokens, mask, eval_root / "scope", "test")
     if feats is None:
         return None
     pooled = mean_pool(feats.float(), mask)
@@ -317,7 +342,7 @@ def eval_proteingym(featuriser, eval_root: Path, max_len: int) -> dict | None:
         if split is None or "positions" not in split:
             continue
         tokens, mask = to_padded(split, max_len)
-        feats = featuriser(tokens, mask)
+        feats = featurise(featuriser, tokens, mask, path.parent, path.stem)
         if feats is None:
             return None
         positions = torch.from_numpy(split["positions"].astype(np.int64)).clamp(max=mask.shape[1] - 1)
@@ -423,13 +448,17 @@ def main(argv: list[str] | None = None) -> int:
                 enc, t, m, batch_size=args.batch_size, device=device
             )
         elif name == "esmif1":
-            featuriser = lambda t, m: None  # noqa: E731 - needs per-split files
-            print(
-                "[eval] NOTE: the esmif1 ceiling probe needs <split>_esmif1.npy next to each "
-                "split. Without it the L1 ceiling is missing, and you cannot report how much "
-                "of any C3 gain is ESM-IF1 already knowing the answer.",
-                file=sys.stderr,
-            )
+            # Built by scripts/build_ceiling_features.py for the structure tasks
+            # only; fitness tasks report "data missing" by design.
+            featuriser = esmif1_features
+            if not any(args.eval_data.glob("*/*_esmif1.npy")):
+                print(
+                    "[eval] NOTE: no <split>_esmif1.npy found. Run "
+                    "scripts/build_ceiling_features.py, or the L1 ceiling is missing and "
+                    "you cannot report how much of any C3 gain is ESM-IF1 already "
+                    "knowing the answer.",
+                    file=sys.stderr,
+                )
         else:  # esm2
             try:
                 import esm

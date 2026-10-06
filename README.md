@@ -89,7 +89,11 @@ python scripts/extract_3di.py --shards data/structures \
 python scripts/run_grid.py --corpus data/corpus --out runs/ --tier 1
 python scripts/run_grid.py --corpus data/corpus --out runs/ --tier 2 --tier 3
 
-# Phases 5-6 -- evaluate and aggregate
+# Phases 5-6 -- evaluate and aggregate. The L1 ceiling (ESM-IF1 features of the
+# eval proteins: real ASTRAL structures for SCOPe, ESMFold for SS and contact)
+# needs the corpus PCA basis, so it runs after extraction.
+python scripts/build_ceiling_features.py --eval-data data/eval --corpus data/corpus \
+    --scope-tarball pdbstyle-sel-gs-bib-40-2.08.tgz
 python scripts/run_eval.py --runs runs/ --eval-data data/eval --out results/
 python scripts/aggregate_results.py --results results/ --out report/
 ```
@@ -106,6 +110,7 @@ export RUNPOD_API_KEY=...                        # RUNPOD_POD_ID is already set
 
 ./scripts/pod_session.sh pilot --no-terminate    # first time: watch it
 ./scripts/pod_session.sh extract                 # needs a 60 GB container disk
+./scripts/pod_session.sh ceiling                 # L1 ceiling features, after extract
 ./scripts/pod_session.sh grid --tier 1
 ./scripts/pod_session.sh eval
 ```

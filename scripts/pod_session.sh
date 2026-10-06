@@ -15,6 +15,7 @@
 # Usage:
 #   ./scripts/pod_session.sh pilot
 #   ./scripts/pod_session.sh extract
+#   ./scripts/pod_session.sh ceiling
 #   ./scripts/pod_session.sh grid --tier 1
 #   ./scripts/pod_session.sh eval
 #
@@ -51,14 +52,16 @@ done
 case "$PHASE" in
   pilot)   DEFAULT_HOURS=2  ;;
   extract) DEFAULT_HOURS=6  ;;
+  ceiling) DEFAULT_HOURS=6  ;;
   grid)    DEFAULT_HOURS=12 ;;
   eval)    DEFAULT_HOURS=4  ;;
   *)
     cat >&2 <<'USAGE'
-usage: pod_session.sh {pilot|extract|grid|eval} [--no-terminate] [--max-hours N] [args...]
+usage: pod_session.sh {pilot|extract|ceiling|grid|eval} [--no-terminate] [--max-hours N] [args...]
 
   pilot    measure throughput, settle bucket policy and head count (~1-2 h)
   extract  ESM-IF1 -> PCA cache -> push to HF (~3-4 h, needs 60 GB disk)
+  ceiling  ESM-IF1 features of the eval proteins, the L1 ceiling (~3-4 h)
   grid     the condition grid, tiered and spend-capped (~8-11 h)
   eval     probes and aggregation (~3 h)
 USAGE
@@ -103,7 +106,11 @@ push_results() {
   [[ -z "${HF_REPO:-}" ]] && { log "HF_REPO unset -- cannot push results"; return 1; }
   log "pushing results to ${HF_REPO} ..."
   local ok=1
-  for dir in runs results report data/corpus; do
+  local dirs=(runs results report data/corpus)
+  # Ceiling features are the only thing that phase makes; pushing data/eval
+  # from any other phase would just re-upload what was pulled.
+  [[ "$PHASE" == "ceiling" ]] && dirs+=(data/eval)
+  for dir in "${dirs[@]}"; do
     [[ -d "$WORKDIR/$dir" ]] || continue
     if "$HF_CLI" upload "$HF_REPO" "$WORKDIR/$dir" "$dir" \
          --repo-type dataset >/dev/null 2>&1; then
@@ -268,13 +275,16 @@ fi
 # it consumes from the dataset repo. Extraction needs the backbone shards and
 # the leakage-filtered allowlist, plus the ESM-IF1 stack, which is checked
 # against the real model before hours of extraction are paid for.
-if [[ "$PHASE" == "extract" ]]; then
+if [[ "$PHASE" == "extract" || "$PHASE" == "ceiling" ]]; then
   log "installing the ESM-IF1 stack"
   pip install -q fair-esm biotite torch_geometric 2>&1 | tail -3 >&2
   TORCH_TAG=$(python -c "import torch; print(torch.__version__.split('+')[0] + '+cu' + (torch.version.cuda or '').replace('.', ''))")
   # Optional: xjepa.data.scatter_shim stands in when no wheel exists.
   pip install -q torch-scatter -f "https://data.pyg.org/whl/torch-${TORCH_TAG}.html" \
     >/dev/null 2>&1 || log "no torch-scatter wheel for ${TORCH_TAG}; using the shim"
+fi
+
+if [[ "$PHASE" == "extract" ]]; then
   log "pulling shards and splits from ${HF_REPO}"
   "$HF_CLI" download "$HF_REPO" --repo-type dataset \
     --include 'data/structures/shard_*.npz' --local-dir . >/dev/null
@@ -288,6 +298,20 @@ if [[ "$PHASE" == "extract" ]]; then
   python scripts/check_esmif1.py >&2 || { log "ESM-IF1 check FAILED. Not extracting."; exit 1; }
 fi
 
+if [[ "$PHASE" == "ceiling" ]]; then
+  log "checking ESM-IF1 imports and residue alignment"
+  python scripts/check_esmif1.py >&2 || { log "ESM-IF1 check FAILED. Not running."; exit 1; }
+  pip install -q transformers accelerate 2>&1 | tail -3 >&2
+  log "pulling eval data from ${HF_REPO}"
+  "$HF_CLI" download "$HF_REPO" --repo-type dataset \
+    --include 'data/eval/*' --local-dir . >/dev/null
+  if [[ ! -s data/astral40.tgz ]]; then
+    log "downloading the ASTRAL 2.08 40% structures (~1 GB)"
+    curl -fsSL -o data/astral40.tgz \
+      https://scop.berkeley.edu/downloads/pdbstyle/pdbstyle-sel-gs-bib-40-2.08.tgz
+  fi
+fi
+
 if [[ "$PHASE" == "eval" ]]; then
   log "pulling eval data and finished runs from ${HF_REPO}"
   "$HF_CLI" download "$HF_REPO" --repo-type dataset \
@@ -299,7 +323,7 @@ if [[ "$PHASE" == "eval" ]]; then
 fi
 
 # Pull the cached corpus for phases that consume it.
-if [[ "$PHASE" == "grid" || "$PHASE" == "eval" ]]; then
+if [[ "$PHASE" == "grid" || "$PHASE" == "eval" || "$PHASE" == "ceiling" ]]; then
   if [[ ! -d data/corpus ]]; then
     log "pulling corpus from ${HF_REPO}"
     "$HF_CLI" download "$HF_REPO" --repo-type dataset \
@@ -360,6 +384,12 @@ case "$PHASE" in
     log "target bank RankMe (the H1b ceiling) is in data/corpus/meta.json -- READ IT."
     log "A low value caps what C3 can learn, and it is a go/no-go before the grid."
     cat data/corpus/meta.json >&2 || true
+    ;;
+
+  ceiling)
+    python scripts/build_ceiling_features.py --eval-data data/eval --corpus data/corpus \
+      --scope-tarball data/astral40.tgz "${EXTRA_ARGS[@]}"
+    cat data/eval/*/*_esmif1.json >&2 || true
     ;;
 
   grid)
