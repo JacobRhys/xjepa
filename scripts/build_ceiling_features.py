@@ -291,9 +291,13 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     from extract_esmif1 import encoder_embeddings, load_esmif1
+
+    # load_esmif1 applies the fair-esm compat patches (biotite filter_backbone,
+    # torch_scatter); importing esm.inverse_folding before it fails on a
+    # modern stack.
+    model, alphabet = load_esmif1(device)
     from esm.inverse_folding.util import CoordBatchConverter
 
-    model, alphabet = load_esmif1(device)
     converter = CoordBatchConverter(alphabet)
 
     def embed(coords: np.ndarray) -> torch.Tensor:
