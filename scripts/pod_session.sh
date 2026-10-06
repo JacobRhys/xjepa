@@ -264,6 +264,40 @@ if ! python -m pytest -q -x 2>&1 | tail -5 >&2; then
   exit 1
 fi
 
+# data/ is gitignored, so a fresh clone has none of it: every phase pulls what
+# it consumes from the dataset repo. Extraction needs the backbone shards and
+# the leakage-filtered allowlist, plus the ESM-IF1 stack, which is checked
+# against the real model before hours of extraction are paid for.
+if [[ "$PHASE" == "extract" ]]; then
+  log "installing the ESM-IF1 stack"
+  pip install -q fair-esm biotite torch_geometric 2>&1 | tail -3 >&2
+  TORCH_TAG=$(python -c "import torch; print(torch.__version__.split('+')[0] + '+cu' + (torch.version.cuda or '').replace('.', ''))")
+  # Optional: xjepa.data.scatter_shim stands in when no wheel exists.
+  pip install -q torch-scatter -f "https://data.pyg.org/whl/torch-${TORCH_TAG}.html" \
+    >/dev/null 2>&1 || log "no torch-scatter wheel for ${TORCH_TAG}; using the shim"
+  log "pulling shards and splits from ${HF_REPO}"
+  "$HF_CLI" download "$HF_REPO" --repo-type dataset \
+    --include 'data/structures/shard_*.npz' --local-dir . >/dev/null
+  "$HF_CLI" download "$HF_REPO" --repo-type dataset \
+    --include 'data/splits/*' --local-dir . >/dev/null
+  [[ -s data/splits/pretrain_accessions.txt ]] || { log "no allowlist after pull"; exit 1; }
+  N_SHARDS=$(ls data/structures/shard_*.npz 2>/dev/null | wc -l)
+  log "  ${N_SHARDS} shards, $(wc -l < data/splits/pretrain_accessions.txt) allowed chains"
+  [[ "$N_SHARDS" -gt 0 ]] || { log "no shards after pull"; exit 1; }
+  log "checking ESM-IF1 imports and residue alignment"
+  python scripts/check_esmif1.py >&2 || { log "ESM-IF1 check FAILED. Not extracting."; exit 1; }
+fi
+
+if [[ "$PHASE" == "eval" ]]; then
+  log "pulling eval data and finished runs from ${HF_REPO}"
+  "$HF_CLI" download "$HF_REPO" --repo-type dataset \
+    --include 'data/eval/*' --local-dir . >/dev/null
+  "$HF_CLI" download "$HF_REPO" --repo-type dataset \
+    --include 'runs/*' --local-dir . >/dev/null
+  # The public ESM-2 8M sanity anchor; run_eval skips it if this fails.
+  pip install -q fair-esm >/dev/null 2>&1 || log "fair-esm unavailable; esm2 baseline will be skipped"
+fi
+
 # Pull the cached corpus for phases that consume it.
 if [[ "$PHASE" == "grid" || "$PHASE" == "eval" ]]; then
   if [[ ! -d data/corpus ]]; then
