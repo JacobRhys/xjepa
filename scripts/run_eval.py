@@ -162,14 +162,22 @@ def esmif1_features(split_dir: Path, split: str, mask: torch.Tensor) -> torch.Te
                 f"{path.name} holds the first {built_len} residues per protein, but "
                 f"--max-len asks for more; rebuild it or lower --max-len")
     flat = torch.from_numpy(np.load(path))
-    if flat.shape[0] != int(mask.sum()):
-        raise ValueError(
-            f"{path.name} has {flat.shape[0]} rows for {int(mask.sum())} residues; "
-            "it was built with a different --max-len or split")
     n, L = mask.shape
-    out = torch.zeros(n, L, flat.shape[-1], dtype=torch.float16)
+    # A subsampled split stores only some proteins, listed in <split>_esmif1_index.npy.
+    # The rest come back NaN, and the probes drop them -- the ceiling is then
+    # trained on the subsample while every condition is scored on the same test set.
+    index_path = split_dir / f"{split}_esmif1_index.npy"
+    rows = np.load(index_path) if index_path.exists() else np.arange(n)
+    expected = int(mask[torch.from_numpy(rows)].sum())
+    if flat.shape[0] != expected:
+        raise ValueError(
+            f"{path.name} has {flat.shape[0]} rows for {expected} residues; "
+            "it was built with a different --max-len or split")
+    fill = float("nan") if index_path.exists() else 0.0
+    out = torch.full((n, L, flat.shape[-1]), fill, dtype=torch.float16)
+    out[~mask] = 0.0
     cursor = 0
-    for i in range(n):
+    for i in rows.tolist():
         ln = int(mask[i].sum())
         out[i, :ln] = flat[cursor : cursor + ln].to(torch.float16)
         cursor += ln
@@ -213,7 +221,8 @@ def eval_residue_task(
         if feats is None:
             return None
         labels = residue_labels(split, label_key, mask)
-        sel = labels >= 0
+        # Non-finite rows are proteins a subsampled ceiling did not cover.
+        sel = (labels >= 0) & torch.isfinite(feats).all(-1)
         parts[name] = (feats[sel].float(), labels[sel])
 
     data = ResidueTaskData(
@@ -291,7 +300,10 @@ def eval_contact_task(featuriser, eval_root: Path, device, max_len: int) -> dict
         feats = featurise(featuriser, tokens, mask, base, name)
         if feats is None:
             return None
-        parts[name] = contact_examples(split, feats, mask)
+        parts[name] = [
+            ex for ex in contact_examples(split, feats, mask)
+            if torch.isfinite(ex.features).all()
+        ]
 
     res = run_contact_probe(
         parts["train"], parts["valid"], parts["test"], grid=DEFAULT_GRID, device=device

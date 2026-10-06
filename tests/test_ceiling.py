@@ -86,3 +86,17 @@ def test_missing_ceiling_file_reports_data_missing(tmp_path: Path) -> None:
     mask = torch.ones(1, 3, dtype=torch.bool)
     assert featurise(esmif1_features, torch.zeros(1, 3, dtype=torch.long), mask,
                      tmp_path, "test") is None
+
+
+def test_subsampled_ceiling_marks_uncovered_proteins_nan(tmp_path: Path) -> None:
+    seqs = ["MKV", "ACDE", "GH"]
+    tokens, offsets = encode_many(seqs)
+    toks, mask = to_padded({"tokens": tokens, "offsets": offsets}, 8)
+    # Only proteins 0 and 2 were folded.
+    np.save(tmp_path / "train_esmif1_index.npy", np.array([0, 2]))
+    np.save(tmp_path / "train_esmif1.npy", np.arange(5 * 2, dtype=np.float16).reshape(5, 2))
+    feats = featurise(esmif1_features, toks, mask, tmp_path, "train")
+    assert torch.isfinite(feats[0, :3]).all() and torch.isfinite(feats[2, :2]).all()
+    assert torch.isnan(feats[1, :4]).all()
+    assert feats[2, 0, 0] == 6  # protein 2 starts after protein 0's three rows
+    assert torch.isfinite(feats[~mask]).all()  # padding stays finite

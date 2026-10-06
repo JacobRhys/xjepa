@@ -160,7 +160,7 @@ def load_scope_structures(tarball: Path, wanted: set[str]) -> dict[str, tuple[st
 class EsmFold:
     """ESMFold via ``transformers`` -- no openfold build needed."""
 
-    def __init__(self, device: torch.device, chunk_size: int = 64):
+    def __init__(self, device: torch.device, chunk_size: int | None = None):
         from transformers import AutoTokenizer, EsmForProteinFolding
 
         self.device = device
@@ -168,7 +168,11 @@ class EsmFold:
         model = EsmForProteinFolding.from_pretrained(
             "facebook/esmfold_v1", low_cpu_mem_usage=True)
         model.esm = model.esm.half()  # the 3B language model; the trunk stays fp32
+        # Chunking trades speed for memory; at <= 512 residues the pair
+        # representation fits a 24 GB card unchunked.
         model.trunk.set_chunk_size(chunk_size)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
         self.model = model.eval().to(device)
 
     @torch.no_grad()
@@ -210,7 +214,9 @@ def build_split(
     stats: dict,
 ) -> None:
     """Embed every protein's window, saving in resumable chunks."""
-    parts_dir = out_path.parent / f"_{out_path.stem}_parts"
+    # Keyed by protein count, so a run with a different subsample never
+    # resumes from another run's chunks.
+    parts_dir = out_path.parent / f"_{out_path.stem}_parts_{len(seqs)}"
     parts_dir.mkdir(exist_ok=True)
     n_chunks = (len(seqs) + chunk - 1) // chunk
     t0 = time.time()
@@ -275,6 +281,11 @@ def main(argv: list[str] | None = None) -> int:
                    help=f"ASTRAL PDB-style tarball ({SCOPE_TARBALL_URL})")
     p.add_argument("--max-len", type=int, default=512, help="must match run_eval.py")
     p.add_argument("--chunk", type=int, default=250, help="proteins per resumable chunk")
+    p.add_argument("--train-subsample", type=int, default=2000,
+                   help="fold at most this many train proteins per task (fixed seed); "
+                        "0 folds all. ESMFold runs ~0.3-1 protein/s on a 4090, so all "
+                        "10.8k SS train proteins would cost ~10 GPU-hours for a "
+                        "reference line")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--force", action="store_true")
     args = p.parse_args(argv)
@@ -320,17 +331,26 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             with np.load(npz) as z:
                 seqs = split_sequences({k: z[k] for k in ("tokens", "offsets")})
+            index = np.arange(len(seqs))
+            if (split == "train" and STRUCTURE_SOURCE[task] == "esmfold"
+                    and args.train_subsample and len(seqs) > args.train_subsample):
+                index = np.sort(np.random.default_rng(0).choice(
+                    len(seqs), args.train_subsample, replace=False))
+                np.save(base / f"{split}_esmif1_index.npy", index)
+                print(f"[ceiling] {task}/{split}: folding {len(index):,} of "
+                      f"{len(seqs):,} proteins (seed 0)", file=sys.stderr)
+            all_seqs, seqs = seqs, [seqs[i] for i in index]
 
             if task == "scope":
                 sids = fasta_ids(base / "test.fasta")
-                if len(sids) != len(seqs):
+                if len(sids) != len(all_seqs):
                     raise RuntimeError("scope test.fasta and test.npz disagree on order")
                 structs = load_scope_structures(args.scope_tarball, set(sids))
                 print(f"[ceiling] ASTRAL: {len(structs):,}/{len(sids):,} domains found",
                       file=sys.stderr)
 
-                def structure(i: int, window: str, _s=structs, _ids=sids):
-                    hit = _s.get(_ids[i])
+                def structure(i: int, window: str, _s=structs, _ids=sids, _ix=index):
+                    hit = _s.get(_ids[_ix[i]])
                     if hit is None:
                         return np.full((len(window), 3, 3), np.nan, np.float32), None
                     return place_coords(window, *hit), None
@@ -350,6 +370,8 @@ def main(argv: list[str] | None = None) -> int:
                 "structure_source": STRUCTURE_SOURCE[task],
                 "projection": "corpus PCA basis (same space as C3 targets)",
                 "dim": int(project.comps.shape[1]),
+                "n_proteins_in_split": len(all_seqs),
+                "subsampled": bool(len(index) < len(all_seqs)),
                 **stats,
             }
             if STRUCTURE_SOURCE[task] == "esmfold":
