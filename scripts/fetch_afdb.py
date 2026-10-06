@@ -511,7 +511,10 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print("[fetch] streaming reviewed accessions from UniProt ...", file=sys.stderr)
         accessions = uniprot_accessions(
-            target=args.target * 3,  # oversample: not every accession passes pLDDT
+            # Oversample (not every accession passes pLDDT), and count the
+            # skipped prefix: the cap is on the stream, so without it a resumed
+            # run would be starved of exactly the accessions it skipped.
+            target=args.skip + args.target * 3,
             min_len=args.min_len,
             # When cropping, long proteins are wanted, so do not cap the query.
             max_len=args.max_len if args.no_crop_long else None,

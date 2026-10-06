@@ -46,10 +46,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from xjepa.eval.collapse import collapse_metrics
 from xjepa.eval.probes import (
     DEFAULT_GRID,
+    ContactExample,
     PooledTaskData,
     ResidueTaskData,
     extract_features,
     mean_pool,
+    run_contact_probe,
     run_regression_probe,
     run_residue_classification_probe,
 )
@@ -225,6 +227,53 @@ def eval_regression_task(
     return {"val_metric": res.val_metric, **res.test_metrics}
 
 
+def contact_examples(
+    split: dict[str, np.ndarray], feats: torch.Tensor, mask: torch.Tensor
+) -> list[ContactExample]:
+    """Per-protein contact maps from C-alpha coordinates, as TAPE builds them.
+
+    Contact is distance < 8 A; pairs with an unresolved residue or with
+    ``|i - j| < 6`` are invalid. Proteins truncated to ``max_len`` are scored on
+    the window the encoder saw.
+    """
+    coords = torch.from_numpy(split["coords"].astype(np.float32))
+    valid = torch.from_numpy(split["valid"].astype(bool))
+    offsets = split["offsets"].astype(np.int64)
+    out: list[ContactExample] = []
+    for i in range(mask.shape[0]):
+        lo, ln = int(offsets[i]), int(mask[i].sum())
+        xyz, ok = coords[lo : lo + ln], valid[lo : lo + ln]
+        idx = torch.arange(ln)
+        pair_ok = ok[:, None] & ok[None, :] & ((idx[:, None] - idx[None, :]).abs() >= 6)
+        out.append(ContactExample(
+            features=feats[i, :ln],
+            contacts=torch.cdist(xyz, xyz) < 8.0,
+            valid=pair_ok,
+        ))
+    return out
+
+
+def eval_contact_task(featuriser, eval_root: Path, device, max_len: int) -> dict | None:
+    """Contact prediction: bilinear pair probe, P@L/5 medium and long range."""
+    base = eval_root / "contact"
+    splits = {s: load_split(base / f"{s}.npz") for s in ("train", "valid", "test")}
+    if any(v is None for v in splits.values()):
+        return None
+
+    parts: dict[str, list[ContactExample]] = {}
+    for name, split in splits.items():
+        tokens, mask = to_padded(split, max_len)
+        feats = featuriser(tokens, mask)
+        if feats is None:
+            return None
+        parts[name] = contact_examples(split, feats, mask)
+
+    res = run_contact_probe(
+        parts["train"], parts["valid"], parts["test"], grid=DEFAULT_GRID, device=device
+    )
+    return {"val_metric": res.val_metric, **res.test_metrics}
+
+
 def eval_fold_retrieval(featuriser, eval_root: Path, max_len: int) -> dict | None:
     """Zero-shot fold retrieval with superfamily-disjoint query/gallery."""
     split = load_split(eval_root / "scope" / "test.npz")
@@ -311,6 +360,7 @@ def evaluate(
         "ss8": lambda: eval_residue_task(featuriser, eval_root, "ss", "ss8", "ss8", device, max_len),
         "fluorescence": lambda: eval_regression_task(featuriser, eval_root, "fluorescence", device, max_len),
         "stability": lambda: eval_regression_task(featuriser, eval_root, "stability", device, max_len),
+        "contact": lambda: eval_contact_task(featuriser, eval_root, device, max_len),
         "fold_retrieval": lambda: eval_fold_retrieval(featuriser, eval_root, max_len),
         "proteingym": lambda: eval_proteingym(featuriser, eval_root, max_len),
     }
@@ -345,7 +395,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--only", nargs="*", default=None, help="specific run directory names")
     p.add_argument(
         "--tasks", nargs="*",
-        default=["ss3", "ss8", "fluorescence", "stability", "fold_retrieval", "proteingym"],
+        default=["ss3", "ss8", "contact", "fluorescence", "stability", "fold_retrieval", "proteingym"],
     )
     p.add_argument("--baselines", nargs="*", default=list(BASELINES), choices=list(BASELINES))
     p.add_argument("--baselines-only", action="store_true")

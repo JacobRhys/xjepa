@@ -430,6 +430,67 @@ def convert_tape_regression(extracted: Path, out_dir: Path, key: str) -> dict:
     return meta
 
 
+def convert_proteinnet(archive: Path, out_dir: Path, n_train: int, seed: int = 0) -> dict:
+    """TAPE ProteinNet pickles -> sequences plus C-alpha coords and validity.
+
+    The mirror's archive holds ``proteinnet/{train,valid,test}.pickle``, each a
+    list of dicts with ``primary``, ``tertiary`` ([L, 3], Angstrom) and
+    ``valid_mask``. Members are read straight from the tarball, so nothing is
+    extracted to disk -- train alone is ~0.5 GB unpacked.
+
+    Contacts are not stored; they are ``||x_i - x_j|| < 8`` on these coordinates,
+    computed at eval time exactly as TAPE's ``ProteinnetDataset`` does. Note the
+    coordinates are C-alpha (consecutive residues sit 3.8 A apart), which is
+    TAPE's convention rather than the C-beta definition CASP uses.
+
+    Train is subsampled to ``n_train`` proteins with a fixed seed. The probe is a
+    frozen-feature bilinear head trained on 20k sampled pairs per protein, so the
+    full 25k-protein set would multiply eval GPU time for little change in the
+    ranking between conditions. The subsample is recorded in the metadata.
+    """
+    import pickle
+
+    meta: dict = {"splits": {}, "coords": "C-alpha, Angstrom", "contact_threshold_A": 8.0}
+    with tarfile.open(archive) as tf:
+        members = {Path(m.name).stem: m for m in tf.getmembers() if m.name.endswith(".pickle")}
+        for split in ("train", "valid", "test"):
+            if split not in members:
+                print(f"[eval] no {split}.pickle in {archive.name}", file=sys.stderr)
+                continue
+            fh = tf.extractfile(members[split])
+            assert fh is not None
+            records = pickle.load(fh)
+            n_total = len(records)
+            if split == "train" and n_train and n_total > n_train:
+                keep = np.sort(np.random.default_rng(seed).choice(n_total, n_train, replace=False))
+                records = [records[i] for i in keep]
+            seqs = [r["primary"] for r in records]
+            coords = np.concatenate(
+                [np.asarray(r["tertiary"], dtype=np.float32) for r in records])
+            valid = np.concatenate([np.asarray(r["valid_mask"], dtype=bool) for r in records])
+            meta["splits"][split] = {
+                **write_split(out_dir, split, seqs, coords=coords, valid=valid),
+                "n_in_source": n_total,
+            }
+            if split == "test":
+                write_fasta(out_dir / "test.fasta", [f"contact_{i}" for i in range(len(seqs))], seqs)
+            del records
+    meta["train_subsample"] = {"n": n_train, "seed": seed}
+    return meta
+
+
+def _extract_all(tf: tarfile.TarFile, dest: Path) -> None:
+    """``extractall`` with the safe ``data`` filter where Python supports it.
+
+    The ``filter`` argument arrived in 3.12 and was backported only to late
+    patch releases, so older interpreters raise ``TypeError`` on it.
+    """
+    try:
+        tf.extractall(dest, filter="data")
+    except TypeError:
+        tf.extractall(dest)  # noqa: S202 - trusted, provenance-checked archives
+
+
 def convert_scope(fasta: Path, out_dir: Path) -> dict:
     """SCOPe ASTRAL FASTA -> sequences with fold and superfamily label ids.
 
@@ -575,6 +636,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--list-sources", action="store_true")
     p.add_argument("--max-assays", type=int, default=10, help="ProteinGym subset size")
     p.add_argument("--max-len", type=int, default=400, help="ProteinGym length cap")
+    p.add_argument("--contact-train", type=int, default=2000,
+                   help="ProteinNet train proteins to keep for the contact probe "
+                        "(fixed-seed subsample; 0 keeps all ~25k)")
     p.add_argument("--push-to", default=None, metavar="REPO",
                    help="HuggingFace dataset to upload converted splits to")
     p.add_argument("--free-space", action="store_true",
@@ -649,15 +713,19 @@ def main(argv: list[str] | None = None) -> int:
                 meta = convert_ss_csv(hf_files, out_dir)
             elif task in ("fluorescence", "stability") and hf_files:
                 meta = convert_regression_table(hf_files, out_dir, task)
+            elif task == "contact" and raw.is_file():
+                meta = convert_proteinnet(raw, out_dir, n_train=args.contact_train)
             else:
                 extracted = cache / f"{task}_x"
                 if raw.is_dir():
                     extracted = raw
-                elif not extracted.exists():
+                # An empty directory is a previous run that died mid-extract;
+                # treating it as done would convert nothing, forever.
+                elif not extracted.exists() or not any(extracted.iterdir()):
                     extracted.mkdir(parents=True, exist_ok=True)
                     with tarfile.open(raw) as tf:
-                        tf.extractall(extracted, filter="data")
-                if task in ("ss", "contact"):
+                        _extract_all(tf, extracted)
+                if task == "ss":
                     meta = convert_tape_residue(extracted, out_dir)
                 else:
                     meta = convert_tape_regression(

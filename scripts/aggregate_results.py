@@ -40,7 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 TASK_METRICS: dict[str, tuple[str, bool]] = {
     "ss3": ("accuracy", True),
     "ss8": ("accuracy", True),
-    "contact": ("precision_at_l5_long", True),
+    "contact": ("p_at_l5_long", True),
     "fold_retrieval": ("top1_accuracy", True),
     "fluorescence": ("spearman", True),
     "stability": ("spearman", True),

@@ -124,8 +124,15 @@ def encoder_embeddings(model, batch_converter, coords: np.ndarray, device: torch
 
 
 def iter_chains(shard_dir: Path, allow: set[str] | None, limit: int | None) -> Iterator[tuple[str, str, np.ndarray]]:
-    """Yield ``(accession, sequence, coords)`` from the fetched shards in order."""
+    """Yield ``(accession, sequence, coords)`` from the fetched shards in order.
+
+    Each accession is yielded once. The short-band top-up queried UniProt
+    separately, so a short protein can sit in a main shard and a short shard;
+    without this it would enter the corpus twice and be trained on at double
+    weight.
+    """
     n = 0
+    seen: set[str] = set()
     for shard in sorted(shard_dir.glob("shard_*.npz")):
         with np.load(shard, allow_pickle=True) as z:
             accs = list(z["accessions"])
@@ -134,8 +141,9 @@ def iter_chains(shard_dir: Path, allow: set[str] | None, limit: int | None) -> I
             coords = z["coords"]
         for i, (acc, seq) in enumerate(zip(accs, seqs)):
             acc = str(acc)
-            if allow is not None and acc not in allow:
+            if (allow is not None and acc not in allow) or acc in seen:
                 continue
+            seen.add(acc)
             lo, hi = int(offsets[i]), int(offsets[i + 1])
             yield acc, str(seq), coords[lo:hi]
             n += 1
@@ -144,15 +152,21 @@ def iter_chains(shard_dir: Path, allow: set[str] | None, limit: int | None) -> I
 
 
 def count_chains(shard_dir: Path, allow: set[str] | None, limit: int | None) -> tuple[int, int]:
-    """Count chains and total residues in one cheap metadata pass."""
+    """Count chains and total residues in one cheap metadata pass.
+
+    Deduplicates exactly as :func:`iter_chains` does, so the preallocated bank
+    matches what is written into it.
+    """
     n_chains = n_res = 0
+    seen: set[str] = set()
     for shard in sorted(shard_dir.glob("shard_*.npz")):
         with np.load(shard, allow_pickle=True) as z:
             accs = [str(a) for a in z["accessions"]]
             offsets = z["offsets"]
         for i, acc in enumerate(accs):
-            if allow is not None and acc not in allow:
+            if (allow is not None and acc not in allow) or acc in seen:
                 continue
+            seen.add(acc)
             n_chains += 1
             n_res += int(offsets[i + 1]) - int(offsets[i])
             if limit is not None and n_chains >= limit:
