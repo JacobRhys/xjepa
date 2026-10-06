@@ -55,6 +55,29 @@ inputs as well as their objectives**, and any downstream gap could have come fro
 the input distribution rather than the objective. That is precisely the
 comparison H2 rests on. Every masked condition now uses 80/10/10.
 
+### Corpus as built (6 Oct)
+
+Redundancy clustering and the L0 filter together removed more than the plan
+assumed: SCOPe 40% spans most known folds, so at 30% identity L0 removes about a
+third of cluster representatives. The first build kept 16,517 chains (6.4M
+residues). Fetching further into Swiss-Prot restored most of the planned size:
+
+| stage | chains |
+|---|--:|
+| fetched (unique accessions, pLDDT >= 70) | 79,446 |
+| cluster representatives (50% id / 80% cov) | 33,855 |
+| representatives removed by L0 | 11,016 |
+| **pretraining corpus** | **22,839 chains, 8.90M residues** |
+
+Across all 79,446 fetched sequences, L0 flagged 35,423 (SCOPe 34,432, SS 875,
+contact 114, fluorescence 2); `leaked_ids.tsv` counts sequences, not representatives.
+
+8.9M residues against the planned ~10M; at 1B tokens per run that is ~112 passes,
+identical across conditions. The short band (< 128) ends at **9.2%** of the corpus
+rather than the 17.9% restored before filtering -- short chains are hit harder by
+L0, consistent with SCOPe domains being short. Reported as a deviation; refilling
+it would mean choosing pretraining data by its overlap with the test set.
+
 ### Corpus length policy
 
 Both ends of the length distribution were nearly discarded, for a total of over
