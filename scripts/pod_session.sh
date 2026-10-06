@@ -76,6 +76,12 @@ STARTED_AT=$(date -u +%s)
 
 log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 
+# Stock RunPod PyTorch images ship without huggingface_hub. Install it rather
+# than refuse: without a CLI, results would have nowhere to go.
+if ! command -v hf >/dev/null 2>&1 && ! command -v huggingface-cli >/dev/null 2>&1; then
+  pip install -q -U huggingface_hub >/dev/null 2>&1 || true
+fi
+
 # The CLI was renamed: `huggingface-cli` is deprecated and from
 # huggingface_hub 1.x it refuses to run. Prefer `hf`, fall back for old images.
 # Neither version has a --quiet flag, so output is redirected instead.
