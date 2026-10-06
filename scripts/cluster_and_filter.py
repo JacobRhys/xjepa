@@ -145,7 +145,11 @@ def leaking_ids(
                     continue
                 qid, fident, qcov = parts[0], float(parts[2]), float(parts[3])
                 if fident >= identity and qcov >= coverage:
-                    hits.setdefault(qid, target.name)
+                    # Every eval split is called test.fasta, so name() alone
+                    # collapses them all into one indistinguishable label and
+                    # the report cannot say which benchmark drove the drops.
+                    label = f"{target.parent.name}/{target.name}"
+                    hits.setdefault(qid, label)
     return hits
 
 
@@ -224,7 +228,7 @@ def main(argv: list[str] | None = None) -> int:
                 "leak_identity": args.leak_identity,
                 "leak_coverage": args.leak_coverage,
             },
-            "eval_splits": [f.name for f in args.eval_fasta],
+            "eval_splits": [f"{f.parent.name}/{f.name}" for f in args.eval_fasta],
             "note": (
                 "L0 removes pretrain/test overlap only. It does NOT address ESM-IF1 "
                 "having been trained across UniRef50, which is handled by disclosure "
