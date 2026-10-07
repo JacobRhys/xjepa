@@ -166,7 +166,13 @@ cleanup() {
     # would let a wrapper script march on to the next phase.
     [[ "$rc" -eq 0 ]] && rc=1
     log "exited during preflight (code ${rc}); nothing produced, nothing to push"
-    log "pod left running -- you never got as far as doing work on it"
+    if [[ "$TERMINATE" -eq 1 ]]; then
+      # Nothing on this disk is new, and an unattended queue that dies here
+      # would otherwise leave an idle pod billing all night.
+      terminate_pod
+    else
+      log "pod left running (--no-terminate)"
+    fi
     exit "$rc"
   fi
 
@@ -346,7 +352,10 @@ PHASE_STARTED=1
 start_watchdog
 
 if [[ "$HEARTBEAT" -eq 1 ]]; then
-  ( while true; do
+  # set +e: the subshell inherits errexit/pipefail, and `ls runs` failing
+  # before the first run exists used to kill the heartbeat on its first tick.
+  ( set +e
+    while true; do
       sleep 600
       {
         echo "phase=${PHASE} elapsed_min=$(elapsed_min) ceiling_h=${MAX_HOURS}"

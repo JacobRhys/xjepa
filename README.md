@@ -107,6 +107,7 @@ not protect against that; the instance ending itself does.
 ```bash
 export HF_REPO=youruser/xjepa HF_TOKEN=hf_...   # results land here
 export RUNPOD_API_KEY=...                        # RUNPOD_POD_ID is already set
+./scripts/pod_deadman.sh 8                       # FIRST: hard stop in 8 h, no matter what
 
 ./scripts/pod_session.sh pilot --no-terminate    # first time: watch it
 ./scripts/pod_session.sh extract                 # needs a 60 GB container disk
@@ -120,6 +121,13 @@ spending GPU time on a broken tree, pushes a heartbeat every 10 minutes so
 progress is visible without SSH, and enforces a hard wall-clock ceiling per
 phase. **If the results push fails it does not terminate** -- another hour of
 credit is recoverable, four hours of lost extraction is not.
+
+The deadman is the backstop for everything the script cannot see: a shell
+sitting idle between phases, a queued phase that never started, a phase run with
+`--no-terminate`. It is detached from the terminal, checks the API key before
+arming, and is the only thing that would have stopped the 6-7 Oct pod idling for
+seven hours. To queue phases, chain them in one shell rather than polling from
+another window: `./scripts/pod_session.sh ceiling --no-terminate; ./scripts/pod_session.sh grid --tier 1`.
 
 ### Three gates
 

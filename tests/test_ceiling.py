@@ -18,7 +18,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from scripts.build_ceiling_features import parse_pdbstyle, place_coords, split_sequences
+from scripts.build_ceiling_features import (
+    esmfold_safe, parse_pdbstyle, place_coords, split_sequences)
 from scripts.run_eval import esmif1_features, featurise, to_padded
 from xjepa.data.alphabet import encode_many
 
@@ -100,3 +101,8 @@ def test_subsampled_ceiling_marks_uncovered_proteins_nan(tmp_path: Path) -> None
     assert torch.isnan(feats[1, :4]).all()
     assert feats[2, 0, 0] == 6  # protein 2 starts after protein 0's three rows
     assert torch.isfinite(feats[~mask]).all()  # padding stays finite
+
+
+def test_esmfold_safe_maps_rare_residues_to_x_in_place() -> None:
+    # SS test protein 149 carries a U; ESMFold's tokenizer has no U and crashed.
+    assert esmfold_safe("MKUVZBOX") == "MKXVXXXX"

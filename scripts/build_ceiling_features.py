@@ -157,6 +157,16 @@ def load_scope_structures(tarball: Path, wanted: set[str]) -> dict[str, tuple[st
     return found
 
 
+#: ESMFold's tokenizer covers the 20 standard residues plus X only. Anything
+#: else (U, Z, B, O) tokenizes to None and crashes the fold, so it is folded as
+#: X -- one residue for one residue, so the window's alignment is unchanged.
+ESMFOLD_RESIDUES = frozenset("ACDEFGHIKLMNPQRSTVWYX")
+
+
+def esmfold_safe(seq: str) -> str:
+    return "".join(c if c in ESMFOLD_RESIDUES else "X" for c in seq)
+
+
 class EsmFold:
     """ESMFold via ``transformers`` -- no openfold build needed."""
 
@@ -177,7 +187,8 @@ class EsmFold:
 
     @torch.no_grad()
     def __call__(self, seq: str) -> tuple[np.ndarray, float]:
-        ids = self.tok([seq], return_tensors="pt", add_special_tokens=False)["input_ids"]
+        ids = self.tok([esmfold_safe(seq)], return_tensors="pt",
+                       add_special_tokens=False)["input_ids"]
         out = self.model(ids.to(self.device))
         # atom14 order begins N, CA, C for every residue type.
         coords = out["positions"][-1, 0, :, :3].float().cpu().numpy()
