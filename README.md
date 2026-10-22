@@ -120,8 +120,8 @@ export RUNPOD_API_KEY=...                        # RUNPOD_POD_ID is already set
 on any Ampere+ GPU: SS/SCOPe ceiling, the 11-run core grid, eval, report.
 
 ```bash
-./scripts/pod_deadman.sh 16
-RATE_USD=0.44 ./scripts/pod_session.sh study    # TOTAL_TOKENS=... to override the GPU-class default
+RATE_USD=0.90 ./scripts/pod_deadman.sh 6.2     # $5.58 hard stop
+RATE_USD=0.90 ./scripts/pod_session.sh study    # 500M tokens/run; TOTAL_TOKENS=... overrides
 ```
 
 It refuses to start without somewhere to put results, runs the test suite before

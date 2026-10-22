@@ -29,7 +29,7 @@
 #   RUNPOD_POD_ID    set automatically inside a RunPod pod
 #   MAX_HOURS        hard ceiling for the whole session; default per phase
 #   REPO_URL         git repo to clone if not already present
-#   TOTAL_TOKENS     study only: per-run token budget; default by GPU class
+#   TOTAL_TOKENS     study only: per-run token budget (default 500M)
 #   RATE_USD         study only: USD per GPU hour for the spend ledger (default 0.75)
 
 set -euo pipefail
@@ -58,7 +58,7 @@ case "$PHASE" in
   ceiling) DEFAULT_HOURS=6  ;;
   grid)    DEFAULT_HOURS=12 ;;
   eval)    DEFAULT_HOURS=4  ;;
-  study)   DEFAULT_HOURS=14 ;;
+  study)   DEFAULT_HOURS=5.5 ;;  # sized to a $6 credit at $0.90/h
   *)
     cat >&2 <<'USAGE'
 usage: pod_session.sh {pilot|extract|ceiling|grid|eval|study} [--no-terminate] [--max-hours N] [args...]
@@ -68,8 +68,8 @@ usage: pod_session.sh {pilot|extract|ceiling|grid|eval|study} [--no-terminate] [
   ceiling  ESM-IF1 features of the eval proteins, the L1 ceiling (~3-4 h)
   grid     the condition grid, tiered and spend-capped (~8-11 h)
   eval     probes and aggregation (~3 h)
-  study    v3 reduced scope in one session: SS+SCOPe ceiling, 11-run core
-           grid, SS+SCOPe eval, report (~6-8 h on a 3090/A5000)
+  study    v3 reduced scope in one session: 11-run core grid, SS+SCOPe
+           eval, report, then the capped SS+SCOPe ceiling (~4-5 h on a 4090)
 USAGE
     exit 2 ;;
 esac
@@ -293,9 +293,12 @@ fi
 # it consumes from the dataset repo. Extraction needs the backbone shards and
 # the leakage-filtered allowlist, plus the ESM-IF1 stack, which is checked
 # against the real model before hours of extraction are paid for.
+#: study only: cleared when the ceiling's setup fails, so the grid still runs.
+CEILING_OK=1
+
 if [[ "$PHASE" == "extract" || "$PHASE" == "ceiling" || "$PHASE" == "study" ]]; then
   log "installing the ESM-IF1 stack"
-  pip install -q fair-esm biotite torch_geometric 2>&1 | tail -3 >&2
+  pip install -q fair-esm biotite torch_geometric 2>&1 | tail -3 >&2 || CEILING_OK=0
   TORCH_TAG=$(python -c "import torch; print(torch.__version__.split('+')[0] + '+cu' + (torch.version.cuda or '').replace('.', ''))")
   # Optional: xjepa.data.scatter_shim stands in when no wheel exists.
   pip install -q torch-scatter -f "https://data.pyg.org/whl/torch-${TORCH_TAG}.html" \
@@ -316,17 +319,31 @@ if [[ "$PHASE" == "extract" ]]; then
   python scripts/check_esmif1.py >&2 || { log "ESM-IF1 check FAILED. Not extracting."; exit 1; }
 fi
 
-if [[ "$PHASE" == "ceiling" || "$PHASE" == "study" ]]; then
+if [[ "$PHASE" == "ceiling" ]]; then
   log "checking ESM-IF1 imports and residue alignment"
   python scripts/check_esmif1.py >&2 || { log "ESM-IF1 check FAILED. Not running."; exit 1; }
-  pip install -q transformers accelerate 2>&1 | tail -3 >&2
+fi
+if [[ "$PHASE" == "study" ]]; then
+  # The ceiling is a baseline, not the experiment: in a credit-limited session a
+  # broken ESM-IF1 stack downgrades to "no ceiling" instead of aborting the grid.
+  if [[ "$CEILING_OK" -eq 1 ]] && python scripts/check_esmif1.py >&2; then
+    log "ESM-IF1 check passed; the ceiling will run after the grid"
+  else
+    log "ESM-IF1 setup FAILED -- the study runs without the L1 ceiling"
+    CEILING_OK=0
+  fi
+fi
+if [[ "$PHASE" == "ceiling" || "$PHASE" == "study" ]]; then
+  pip install -q transformers accelerate 2>&1 | tail -3 >&2 || CEILING_OK=0
   log "pulling eval data from ${HF_REPO}"
   "$HF_CLI" download "$HF_REPO" --repo-type dataset \
     --include 'data/eval/*' --local-dir . >/dev/null
   if [[ ! -s data/astral40.tgz ]]; then
     log "downloading the ASTRAL 2.08 40% structures (~1 GB)"
     curl -fsSL -o data/astral40.tgz \
-      https://scop.berkeley.edu/downloads/pdbstyle/pdbstyle-sel-gs-bib-40-2.08.tgz
+      https://scop.berkeley.edu/downloads/pdbstyle/pdbstyle-sel-gs-bib-40-2.08.tgz \
+      || { [[ "$PHASE" == "study" ]] && CEILING_OK=0 && rm -f data/astral40.tgz; } \
+      || exit 1
   fi
 fi
 
@@ -423,37 +440,45 @@ case "$PHASE" in
     ;;
 
   study)
-    # RESEARCH_PLAN.md v3. The token budget is chosen by GPU class so the grid
-    # fits the session: 1B on 4090-class or faster, 500M on anything slower.
-    # Whichever is chosen applies to every run, so the control holds.
+    # RESEARCH_PLAN.md v3. Ordered by value: the grid and its eval first, the
+    # report pushed as soon as it exists, the optional ceiling last and capped,
+    # so running out of time or credit costs the least important thing.
+    # 500M tokens on every GPU by default; the same budget for every run.
+    TOTAL_TOKENS="${TOTAL_TOKENS:-500000000}"
     GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
-    if [[ -z "${TOTAL_TOKENS:-}" ]]; then
-      if [[ "$GPU_NAME" =~ 4090|L40S|A100|H100|H200 ]]; then
-        TOTAL_TOKENS=1000000000
-      else
-        TOTAL_TOKENS=500000000
-      fi
-    fi
     log "GPU ${GPU_NAME}: ${TOTAL_TOKENS} tokens per run"
+    TASKS=(ss3 ss8 fold_retrieval)
 
-    # The ceiling is a baseline, not the experiment: a failure here must not
-    # cost the grid, so it is allowed to fail and the eval reports it missing.
-    log "step 1/3: L1 ceiling for SS and SCOPe (contact dropped in v3)"
-    python scripts/build_ceiling_features.py --eval-data data/eval --corpus data/corpus \
-      --scope-tarball data/astral40.tgz --tasks ss scope \
-      || log "CEILING FAILED -- continuing; the esmif1 baseline will be missing"
-    "$HF_CLI" upload "$HF_REPO" data/eval data/eval --repo-type dataset >/dev/null 2>&1 || true
-
-    log "step 2/3: core grid, 11 runs"
-    # --continue-on-failure: one crashed cell must not strand the rest of the night.
+    log "step 1/4: core grid, 11 runs"
+    # --continue-on-failure: one crashed cell must not strand the rest.
     python scripts/run_grid.py --corpus data/corpus --out runs/ --core \
-      --total-tokens "$TOTAL_TOKENS" --max-minutes 75 --rate "${RATE_USD:-0.75}" \
+      --total-tokens "$TOTAL_TOKENS" --max-minutes 45 --rate "${RATE_USD:-0.75}" \
       --continue-on-failure "${EXTRA_ARGS[@]}" || log "grid finished with failures"
 
-    log "step 3/3: eval on SS and SCOPe, then the report"
+    log "step 2/4: eval on SS and SCOPe (all baselines except the ceiling)"
     python scripts/run_eval.py --runs runs/ --eval-data data/eval --out results/ \
-      --tasks ss3 ss8 fold_retrieval
+      --tasks "${TASKS[@]}" --baselines random onehot esm2
     python scripts/aggregate_results.py --results results/ --out report/
+    for d in runs results report; do
+      "$HF_CLI" upload "$HF_REPO" "$d" "$d" --repo-type dataset >/dev/null 2>&1 \
+        && log "  pushed $d" || log "  push of $d failed; retried at exit"
+    done
+    log "CORE RESULTS ARE ON HUGGINGFACE (report/results.md)"
+
+    if [[ "$CEILING_OK" -eq 1 ]]; then
+      log "step 3/4: L1 ceiling for SS and SCOPe, capped at ${CEILING_MINUTES:-50} min"
+      timeout "$(( ${CEILING_MINUTES:-50} * 60 ))" \
+        python scripts/build_ceiling_features.py --eval-data data/eval --corpus data/corpus \
+          --scope-tarball data/astral40.tgz --tasks scope ss \
+        || log "CEILING FAILED OR TIMED OUT -- partial ceiling only"
+      log "step 4/4: ceiling baseline and final report"
+      python scripts/run_eval.py --baselines-only --baselines esmif1 \
+        --eval-data data/eval --out results/ --tasks "${TASKS[@]}" \
+        || log "ceiling eval failed; the core report stands"
+      python scripts/aggregate_results.py --results results/ --out report/
+    else
+      log "steps 3-4 skipped: no ESM-IF1 stack"
+    fi
     ;;
 esac
 

@@ -72,4 +72,4 @@ setsid nohup bash -c "
 echo $! > "$STATE.pid"
 
 echo "deadman armed: pod ${RUNPOD_POD_ID} terminates at $(cat "$STATE.at") UTC"
-echo "  (${HOURS} h from now; worst case ~\$$(python3 -c "print(round(float('$HOURS') * 0.75, 2))") at \$0.75/h)"
+echo "  (${HOURS} h from now; worst case ~\$$(python3 -c "print(round(float('$HOURS') * float('${RATE_USD:-0.75}'), 2))") at \$${RATE_USD:-0.75}/h)"

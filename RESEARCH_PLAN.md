@@ -36,8 +36,8 @@ not on outcomes.
 |---|---|---|
 | Runs | 23 | **11**: C1, C2, C3 × 3 seeds; C5b × 2 (`run_grid.py --core`) |
 | Run order | tier-major | seed-major, so a cut-short session still covers every condition at seed 0 |
-| Tokens / run | 1.0B | **1.0B on 4090-class or faster, 0.5B otherwise**, identical across every run. §6.1 already sanctioned 0.5B; the schedule horizon scales with it |
-| Wall-clock cap / run | 35 min | 75 min. At 35 min a slower GPU would stop C2/C3 (which carry a predictor) before C1, unmatching tokens. The grid now warns if any run stops on the cap |
+| Tokens / run | 1.0B | **0.5B**, identical across every run. §6.1 already sanctioned 0.5B; the schedule horizon scales with it |
+| Wall-clock cap / run | 35 min | 45 min. At 35 min a slower GPU would stop C2/C3 (which carry a predictor) before C1, unmatching tokens. The grid now warns if any run stops on the cap |
 | GPU | RTX 4090 | any Ampere+ (3090, A5000, A40, L40S, 4090, ...); wall-clock column reports which |
 | Tasks | 7 | **SS3, SS8, SCOPe fold retrieval**. Contact, fluorescence, stability and ProteinGym dropped |
 | L1 ceiling | SS, contact, SCOPe | SS and SCOPe |
@@ -50,8 +50,10 @@ limitation. **H3 is not tested** (no C4). **H4 is reported descriptively**: C3 v
 C5b isolates the predictor, but the criterion needs C5c and ≥5 tasks, so it gets
 no pass/fail. Pre-registered predictions 4 and 5 (§9) are untested.
 
-**Compute.** ~22 min/run on a 3090 at 0.5B → grid ~4 h; ceiling ~0.5 h; eval
-~1.5 h. **~6–8 h, $2–6 at $0.22–0.75/h.**
+**Compute.** A 4090 at $0.90/h against $6 of credit. ~12 min/run at 0.5B → grid
+~2.3 h; eval ~1 h; ceiling last and capped at 50 min. **~4–5 h, ≈ $4–4.5.** The
+session order is grid → eval → report pushed → ceiling, so if time or credit runs
+out, the ceiling is what is lost.
 
 ### Decisions settled by measurement (25 Sept)
 
