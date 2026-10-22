@@ -28,7 +28,7 @@ from scripts.aggregate_results import (
     verdict_h2,
     verdict_h4,
 )
-from scripts.run_grid import build_grid
+from scripts.run_grid import build_grid, core_grid
 
 
 # --------------------------------------------------------------------------- #
@@ -50,6 +50,19 @@ def test_grid_run_names_are_unique_and_match_trainer_convention() -> None:
     assert len(names) == len(set(names)), "a duplicate name would overwrite a run"
     for run in grid:
         assert run.name == f"{run.run_name}-seed{run.seed}"
+
+
+def test_core_grid_is_tier1_plus_c5b_seed_major() -> None:
+    """v3 scope: 11 runs, every condition covered by seed 0 before any seed 1."""
+    core = core_grid()
+    names = [r.name for r in core]
+    assert len(core) == 11 and len(set(names)) == 11
+    assert {r.name for r in build_grid() if r.tier == 1} <= set(names)
+    assert {"c5b_masked_distil-seed0", "c5b_masked_distil-seed1"} <= set(names)
+    assert [r.seed for r in core] == sorted(r.seed for r in core), "must be seed-major"
+    assert {r.run_name for r in core[:4]} == {
+        "c1_mlm", "c2_jepa_ema", "c3_jepa_frozen", "c5b_masked_distil"
+    }
 
 
 def test_grid_variants_do_not_collide_with_their_base_config() -> None:

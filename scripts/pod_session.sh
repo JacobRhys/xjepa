@@ -18,6 +18,7 @@
 #   ./scripts/pod_session.sh ceiling
 #   ./scripts/pod_session.sh grid --tier 1
 #   ./scripts/pod_session.sh eval
+#   ./scripts/pod_session.sh study     # v3 reduced scope: ceiling+grid+eval, one session
 #
 # First time, run with --no-terminate and watch it. Trust it after that.
 #
@@ -28,6 +29,8 @@
 #   RUNPOD_POD_ID    set automatically inside a RunPod pod
 #   MAX_HOURS        hard ceiling for the whole session; default per phase
 #   REPO_URL         git repo to clone if not already present
+#   TOTAL_TOKENS     study only: per-run token budget; default by GPU class
+#   RATE_USD         study only: USD per GPU hour for the spend ledger (default 0.75)
 
 set -euo pipefail
 
@@ -55,15 +58,18 @@ case "$PHASE" in
   ceiling) DEFAULT_HOURS=6  ;;
   grid)    DEFAULT_HOURS=12 ;;
   eval)    DEFAULT_HOURS=4  ;;
+  study)   DEFAULT_HOURS=14 ;;
   *)
     cat >&2 <<'USAGE'
-usage: pod_session.sh {pilot|extract|ceiling|grid|eval} [--no-terminate] [--max-hours N] [args...]
+usage: pod_session.sh {pilot|extract|ceiling|grid|eval|study} [--no-terminate] [--max-hours N] [args...]
 
   pilot    measure throughput, settle bucket policy and head count (~1-2 h)
   extract  ESM-IF1 -> PCA cache -> push to HF (~3-4 h, needs 60 GB disk)
   ceiling  ESM-IF1 features of the eval proteins, the L1 ceiling (~3-4 h)
   grid     the condition grid, tiered and spend-capped (~8-11 h)
   eval     probes and aggregation (~3 h)
+  study    v3 reduced scope in one session: SS+SCOPe ceiling, 11-run core
+           grid, SS+SCOPe eval, report (~6-8 h on a 3090/A5000)
 USAGE
     exit 2 ;;
 esac
@@ -115,7 +121,7 @@ push_results() {
   local dirs=(runs results report data/corpus)
   # Ceiling features are the only thing that phase makes; pushing data/eval
   # from any other phase would just re-upload what was pulled.
-  [[ "$PHASE" == "ceiling" ]] && dirs+=(data/eval)
+  [[ "$PHASE" == "ceiling" || "$PHASE" == "study" ]] && dirs+=(data/eval)
   for dir in "${dirs[@]}"; do
     [[ -d "$WORKDIR/$dir" ]] || continue
     if "$HF_CLI" upload "$HF_REPO" "$WORKDIR/$dir" "$dir" \
@@ -287,7 +293,7 @@ fi
 # it consumes from the dataset repo. Extraction needs the backbone shards and
 # the leakage-filtered allowlist, plus the ESM-IF1 stack, which is checked
 # against the real model before hours of extraction are paid for.
-if [[ "$PHASE" == "extract" || "$PHASE" == "ceiling" ]]; then
+if [[ "$PHASE" == "extract" || "$PHASE" == "ceiling" || "$PHASE" == "study" ]]; then
   log "installing the ESM-IF1 stack"
   pip install -q fair-esm biotite torch_geometric 2>&1 | tail -3 >&2
   TORCH_TAG=$(python -c "import torch; print(torch.__version__.split('+')[0] + '+cu' + (torch.version.cuda or '').replace('.', ''))")
@@ -310,7 +316,7 @@ if [[ "$PHASE" == "extract" ]]; then
   python scripts/check_esmif1.py >&2 || { log "ESM-IF1 check FAILED. Not extracting."; exit 1; }
 fi
 
-if [[ "$PHASE" == "ceiling" ]]; then
+if [[ "$PHASE" == "ceiling" || "$PHASE" == "study" ]]; then
   log "checking ESM-IF1 imports and residue alignment"
   python scripts/check_esmif1.py >&2 || { log "ESM-IF1 check FAILED. Not running."; exit 1; }
   pip install -q transformers accelerate 2>&1 | tail -3 >&2
@@ -324,7 +330,7 @@ if [[ "$PHASE" == "ceiling" ]]; then
   fi
 fi
 
-if [[ "$PHASE" == "eval" ]]; then
+if [[ "$PHASE" == "eval" || "$PHASE" == "study" ]]; then
   log "pulling eval data and finished runs from ${HF_REPO}"
   "$HF_CLI" download "$HF_REPO" --repo-type dataset \
     --include 'data/eval/*' --local-dir . >/dev/null
@@ -335,7 +341,7 @@ if [[ "$PHASE" == "eval" ]]; then
 fi
 
 # Pull the cached corpus for phases that consume it.
-if [[ "$PHASE" == "grid" || "$PHASE" == "eval" || "$PHASE" == "ceiling" ]]; then
+if [[ "$PHASE" == "grid" || "$PHASE" == "eval" || "$PHASE" == "ceiling" || "$PHASE" == "study" ]]; then
   if [[ ! -d data/corpus ]]; then
     log "pulling corpus from ${HF_REPO}"
     "$HF_CLI" download "$HF_REPO" --repo-type dataset \
@@ -413,6 +419,40 @@ case "$PHASE" in
 
   eval)
     python scripts/run_eval.py --runs runs/ --eval-data data/eval --out results/ "${EXTRA_ARGS[@]}"
+    python scripts/aggregate_results.py --results results/ --out report/
+    ;;
+
+  study)
+    # RESEARCH_PLAN.md v3. The token budget is chosen by GPU class so the grid
+    # fits the session: 1B on 4090-class or faster, 500M on anything slower.
+    # Whichever is chosen applies to every run, so the control holds.
+    GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
+    if [[ -z "${TOTAL_TOKENS:-}" ]]; then
+      if [[ "$GPU_NAME" =~ 4090|L40S|A100|H100|H200 ]]; then
+        TOTAL_TOKENS=1000000000
+      else
+        TOTAL_TOKENS=500000000
+      fi
+    fi
+    log "GPU ${GPU_NAME}: ${TOTAL_TOKENS} tokens per run"
+
+    # The ceiling is a baseline, not the experiment: a failure here must not
+    # cost the grid, so it is allowed to fail and the eval reports it missing.
+    log "step 1/3: L1 ceiling for SS and SCOPe (contact dropped in v3)"
+    python scripts/build_ceiling_features.py --eval-data data/eval --corpus data/corpus \
+      --scope-tarball data/astral40.tgz --tasks ss scope \
+      || log "CEILING FAILED -- continuing; the esmif1 baseline will be missing"
+    "$HF_CLI" upload "$HF_REPO" data/eval data/eval --repo-type dataset >/dev/null 2>&1 || true
+
+    log "step 2/3: core grid, 11 runs"
+    # --continue-on-failure: one crashed cell must not strand the rest of the night.
+    python scripts/run_grid.py --corpus data/corpus --out runs/ --core \
+      --total-tokens "$TOTAL_TOKENS" --max-minutes 75 --rate "${RATE_USD:-0.75}" \
+      --continue-on-failure "${EXTRA_ARGS[@]}" || log "grid finished with failures"
+
+    log "step 3/3: eval on SS and SCOPe, then the report"
+    python scripts/run_eval.py --runs runs/ --eval-data data/eval --out results/ \
+      --tasks ss3 ss8 fold_retrieval
     python scripts/aggregate_results.py --results results/ --out report/
     ;;
 esac

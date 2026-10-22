@@ -219,6 +219,10 @@ def verdict_h3(stats: dict[str, dict[str, tuple[float, float, int]]]) -> dict[st
         wins += int(won)
         losses += int(not won)
         per_task.append({"task": task, "c4": c4[task][0], "best_rival": best_rival, "c4_wins": won})
+    if not per_task:
+        # The reduced-scope study (RESEARCH_PLAN.md v3) does not train C4. Absent
+        # evidence is not evidence against, so do not report a failed criterion.
+        return {"criterion": CRITERIA["H3"], "verdict": "NOT TESTED", "note": "no C4 runs"}
     return {
         "criterion": CRITERIA["H3"],
         "per_task": per_task,
@@ -254,6 +258,17 @@ def verdict_h4(stats: dict[str, dict[str, tuple[float, float, int]]]) -> dict[st
 
     isolates = out["controls"].get("c5b_masked_distil", {}).get("wins", 0) >= 5 and \
         out["controls"].get("c5c_predictor_nomask", {}).get("wins", 0) >= 5
+    tested = {c for c, v in out["controls"].items() if v["wins"] + v["losses"]}
+    if not {"c5b_masked_distil", "c5c_predictor_nomask"} <= tested:
+        # v3 trains C5b only, over fewer than 5 tasks, so the pre-registered
+        # criterion cannot be met either way. Report the comparison descriptively.
+        out["verdict"] = "PARTIAL (descriptive only)"
+        out["note"] = (
+            "Reduced scope: the criterion needs both C5b and C5c over >=5 tasks. "
+            "The C3 vs C5b comparison above isolates the predictor and is reported "
+            "without a pass/fail verdict."
+        )
+        return out
     out["verdict"] = "SUPPORTED" if isolates else "NOT SUPPORTED"
     out["note"] = (
         "Masked latent prediction contributes beyond direct distillation."

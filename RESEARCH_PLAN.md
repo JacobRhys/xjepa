@@ -1,6 +1,6 @@
 # Cross-Modal JEPA for Protein Sequences — Costed Research Plan (≤ £10 compute)
 
-**Version:** 2.0 · 25 September 2026 — pilot measured, corpus building
+**Version:** 3.0 · 22 October 2026 — reduced scope for a one-day deadline (see §0.1)
 **Constraint:** total compute spend < £10 (≈ $12.60 @ 1.26 USD/GBP)
 **Deliverable:** 5-condition controlled pretraining study + probe suite, 3 seeds, reproducible on one consumer GPU.
 
@@ -21,6 +21,37 @@ by cutting three axes that do not change what the experiment tests:
 
 **Costed total: ≈ $7.60 (≈ £6.05)**, leaving ~£4 headroom for reruns. A £0 fallback (Kaggle/Colab free tiers)
 is specified in §7.
+
+### 0.1 Reduced scope (v3, 22 Oct) — what is run, and what is not
+
+A one-day deadline and no RTX 4090 capacity on RunPod. Nothing in the code
+depends on the 4090; it needs Ampere or newer (bf16) and ~6 GB of VRAM, 24 GB for
+the ESMFold half of the ceiling. The study is cut to what one unattended session
+on any such GPU can finish, in one command: `pod_session.sh study`.
+
+**Fixed before any grid result was seen.** Every cut below is decided on cost,
+not on outcomes.
+
+| | v2 | v3 |
+|---|---|---|
+| Runs | 23 | **11**: C1, C2, C3 × 3 seeds; C5b × 2 (`run_grid.py --core`) |
+| Run order | tier-major | seed-major, so a cut-short session still covers every condition at seed 0 |
+| Tokens / run | 1.0B | **1.0B on 4090-class or faster, 0.5B otherwise**, identical across every run. §6.1 already sanctioned 0.5B; the schedule horizon scales with it |
+| Wall-clock cap / run | 35 min | 75 min. At 35 min a slower GPU would stop C2/C3 (which carry a predictor) before C1, unmatching tokens. The grid now warns if any run stops on the cap |
+| GPU | RTX 4090 | any Ampere+ (3090, A5000, A40, L40S, 4090, ...); wall-clock column reports which |
+| Tasks | 7 | **SS3, SS8, SCOPe fold retrieval**. Contact, fluorescence, stability and ProteinGym dropped |
+| L1 ceiling | SS, contact, SCOPe | SS and SCOPe |
+| Baselines | random, one-hot, ESM-IF1, ESM-2 8M | unchanged |
+
+**Hypotheses.** H1a, H1b and H2 are tested as pre-registered. H2's "2 of 3
+structure tasks" now counts over SS3, SS8 and fold retrieval; SS3 and SS8 are
+correlated, which makes the test less independent than intended — stated as a
+limitation. **H3 is not tested** (no C4). **H4 is reported descriptively**: C3 vs
+C5b isolates the predictor, but the criterion needs C5c and ≥5 tasks, so it gets
+no pass/fail. Pre-registered predictions 4 and 5 (§9) are untested.
+
+**Compute.** ~22 min/run on a 3090 at 0.5B → grid ~4 h; ceiling ~0.5 h; eval
+~1.5 h. **~6–8 h, $2–6 at $0.22–0.75/h.**
 
 ### Decisions settled by measurement (25 Sept)
 

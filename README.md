@@ -116,6 +116,14 @@ export RUNPOD_API_KEY=...                        # RUNPOD_POD_ID is already set
 ./scripts/pod_session.sh eval
 ```
 
+**Reduced scope (v3, `RESEARCH_PLAN.md` §0.1)** -- the whole study in one session
+on any Ampere+ GPU: SS/SCOPe ceiling, the 11-run core grid, eval, report.
+
+```bash
+./scripts/pod_deadman.sh 16
+RATE_USD=0.44 ./scripts/pod_session.sh study    # TOTAL_TOKENS=... to override the GPU-class default
+```
+
 It refuses to start without somewhere to put results, runs the test suite before
 spending GPU time on a broken tree, pushes a heartbeat every 10 minutes so
 progress is visible without SSH, and enforces a hard wall-clock ceiling per

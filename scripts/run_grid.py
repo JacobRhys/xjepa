@@ -11,6 +11,11 @@ sweep with no coherent story:
 * **Tier 2** -- C4, C5b, C5c x 2 seeds. H3 and the H4 mechanism controls.
 * **Tier 3** -- C5, the lambda sweep, the 3Di target variant, span masking.
 
+``--core`` selects the reduced-scope study (RESEARCH_PLAN.md v3): tier 1 plus
+C5b x 2 seeds, 11 runs, ordered seed-major so that a session cut short still
+leaves every condition with seed 0. ``--total-tokens`` shrinks the budget for
+every run identically, scaling the schedule horizon with it.
+
 Between tiers the launcher stops and prints what it found, because there are
 real decisions there. If C2 did not collapse, the replication failed and the
 entire framing needs rethinking -- and tier 1 is the cheapest possible place to
@@ -24,6 +29,7 @@ preempted spot instance loses at most that.
     python scripts/run_grid.py --corpus data/corpus --out runs/ --tier 1
     python scripts/run_grid.py --corpus data/corpus --out runs/ --tier 2 --tier 3
     python scripts/run_grid.py --corpus data/corpus --out runs/ --dry-run
+    python scripts/run_grid.py --out runs/ --core --total-tokens 500000000
 
 Re-running skips runs that already finished, so this is the resume path after a
 preemption.
@@ -42,6 +48,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 USD_PER_GBP = 1.26
+TOKENS_PER_STEP = 65536  # matches every config; the schedule horizon is derived from it
 
 
 @dataclass(frozen=True)
@@ -110,6 +117,30 @@ def build_grid() -> list[Run]:
         )
     )
     return runs
+
+
+def core_grid() -> list[Run]:
+    """The v3 reduced-scope study: C1/C2/C3 x 3 seeds plus C5b x 2, seed-major.
+
+    Seed-major order means the first four runs already cover every condition,
+    so an interrupted session still answers H1a and gives a first read on H2.
+    """
+    conds = ("c1_mlm", "c2_jepa_ema", "c3_jepa_frozen", "c5b_masked_distil")
+    runs: list[Run] = []
+    for seed in (0, 1, 2):
+        for cfg in conds:
+            if cfg == "c5b_masked_distil" and seed == 2:
+                continue
+            runs.append(Run(f"configs/{cfg}.yaml", seed, tier=1 if cfg != "c5b_masked_distil" else 2))
+    return runs
+
+
+def stop_reason(run_dir: Path) -> str | None:
+    """The trainer's recorded reason for ending, or ``None`` if unreadable."""
+    try:
+        return json.loads((run_dir / "summary.json").read_text()).get("stop_reason")
+    except (OSError, ValueError):
+        return None
 
 
 def is_complete(run_dir: Path) -> bool:
@@ -232,6 +263,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--tier", type=int, action="append", choices=[1, 2, 3],
                    help="tiers to run; repeatable. Default: tier 1 only.")
     p.add_argument("--only", nargs="*", default=None, help="run names to run, ignoring tiers")
+    p.add_argument("--core", action="store_true",
+                   help="the v3 reduced-scope study (11 runs), ignoring tiers")
+    p.add_argument("--total-tokens", type=int, default=None,
+                   help="token budget for EVERY run; the schedule horizon scales with it")
     p.add_argument("--max-minutes", type=float, default=35.0, help="hard wall-clock cap per run")
     p.add_argument("--rate", type=float, default=0.34, help="USD per GPU hour")
     p.add_argument("--budget-gbp", type=float, default=10.0,
@@ -245,11 +280,12 @@ def main(argv: list[str] | None = None) -> int:
 
     tiers = sorted(set(args.tier or [1]))
     grid = build_grid()
-    selected = (
-        [r for r in grid if r.name in set(args.only)]
-        if args.only
-        else [r for r in grid if r.tier in tiers]
-    )
+    if args.core:
+        selected = core_grid()
+    elif args.only:
+        selected = [r for r in grid if r.name in set(args.only)]
+    else:
+        selected = [r for r in grid if r.tier in tiers]
     if not selected:
         print("no runs selected", file=sys.stderr)
         return 1
@@ -258,11 +294,18 @@ def main(argv: list[str] | None = None) -> int:
     extra = list(args.extra)
     if args.corpus:
         extra += ["--set", f"corpus_path={args.corpus}"]
+    if args.total_tokens:
+        # The horizon moves with the budget so every run finishes its cosine
+        # decay; otherwise a smaller budget would stop mid-schedule at high LR.
+        steps = -(-args.total_tokens // TOKENS_PER_STEP)
+        extra += ["--total-tokens", str(args.total_tokens), "--total-steps", str(steps)]
+        print(f"[grid] token budget {args.total_tokens:,} ({steps} steps) for every run",
+              file=sys.stderr)
 
     est_hours = len(selected) * args.max_minutes / 60.0
     est_gbp = est_hours * args.rate / USD_PER_GBP
     print(
-        f"[grid] {len(selected)} runs across tier(s) {tiers}\n"
+        f"[grid] {len(selected)} runs ({'core study' if args.core else f'tier(s) {tiers}'})\n"
         f"[grid] worst case {est_hours:.1f} GPU-h = £{est_gbp:.2f} at ${args.rate:.2f}/h "
         f"(every run hitting the {args.max_minutes:.0f} min cap)\n"
         f"[grid] budget £{args.budget_gbp:.2f}",
@@ -281,8 +324,9 @@ def main(argv: list[str] | None = None) -> int:
     skipped: list[str] = []
     ledger = args.out / "grid_ledger.json"
 
-    for tier in tiers if not args.only else [0]:
-        tier_runs = [r for r in selected if args.only or r.tier == tier]
+    flat = bool(args.only or args.core)
+    for tier in tiers if not flat else [0]:
+        tier_runs = [r for r in selected if flat or r.tier == tier]
         for run in tier_runs:
             run_dir = args.out / run.name
             if is_complete(run_dir) and not args.force:
@@ -306,6 +350,15 @@ def main(argv: list[str] | None = None) -> int:
             )
             spent_hours += hours
             (done if ok else failed).append(run.name)
+            if ok and not args.dry_run and stop_reason(run_dir) == "max_minutes":
+                # A wall-clock stop means this run saw fewer tokens than the
+                # others, which breaks the matched-budget control.
+                print(
+                    f"[grid] WARNING: {run.name} hit the {args.max_minutes:.0f} min cap before "
+                    f"its token budget. It is NOT budget-matched; rerun with a higher "
+                    f"--max-minutes or a lower --total-tokens.",
+                    file=sys.stderr,
+                )
             if not ok and not args.continue_on_failure:
                 print("[grid] stopping on failure (--continue-on-failure to override)",
                       file=sys.stderr)
@@ -325,7 +378,7 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         if not args.dry_run and not args.only:
-            print(tier_report(selected, args.out, tier), file=sys.stderr)
+            print(tier_report(selected, args.out, 1 if args.core else tier), file=sys.stderr)
 
     spent_gbp = spent_hours * args.rate / USD_PER_GBP
     print(
