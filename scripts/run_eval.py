@@ -114,7 +114,7 @@ def residue_labels(split: dict[str, np.ndarray], key: str, mask: torch.Tensor) -
 
 def load_encoder(ckpt_dir: Path, device: torch.device) -> tuple[Encoder, dict]:
     """Rebuild the encoder from a run's checkpoint and config."""
-    from xjepa.train.checkpoint import find_latest, load_checkpoint
+    from xjepa.train.checkpoint import find_latest
 
     summary = json.loads((ckpt_dir / "summary.json").read_text(encoding="utf-8"))
     cfg = summary["config"]
@@ -126,15 +126,14 @@ def load_encoder(ckpt_dir: Path, device: torch.device) -> tuple[Encoder, dict]:
     path = find_latest(ckpt_dir)
     if path is None:
         raise FileNotFoundError(f"no checkpoint in {ckpt_dir}")
-    state = load_checkpoint(path, map_location="cpu")
-    sd = state["model"] if isinstance(state, dict) and "model" in state else state
-    enc_sd = {
-        k.split("encoder.", 1)[1]: v for k, v in sd.items() if k.startswith("encoder.")
-    } or sd
-    missing, unexpected = encoder.load_state_dict(enc_sd, strict=False)
-    if missing:
-        print(f"[eval] WARNING: {len(missing)} missing encoder keys in {ckpt_dir.name}",
-              file=sys.stderr)
+    # Read the payload directly: `load_checkpoint` restores a whole training
+    # model and optimiser, and the eval needs only the encoder's weights.
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    sd = payload["model"] if isinstance(payload, dict) and "model" in payload else payload
+    enc_sd = {k[len("encoder."):]: v for k, v in sd.items() if k.startswith("encoder.")}
+    # Strict: a partial load would evaluate a mostly random encoder and report
+    # it as the condition, which is worse than no result.
+    encoder.load_state_dict(enc_sd, strict=True)
     return encoder.eval().to(device), cfg
 
 
@@ -479,9 +478,14 @@ def main(argv: list[str] | None = None) -> int:
                 model = model.eval().to(device)
 
                 def featuriser(t, m, _model=model):  # type: ignore[misc]
+                    # Batched: one forward over a whole split needs tens of GB.
+                    out = []
                     with torch.no_grad():
-                        rep = _model(t.to(device), repr_layers=[6])["representations"][6]
-                    return rep.to(torch.float16).cpu()
+                        for i in range(0, t.shape[0], args.batch_size):
+                            rep = _model(t[i:i + args.batch_size].to(device),
+                                         repr_layers=[6])["representations"][6]
+                            out.append(rep.to(torch.float16).cpu())
+                    return torch.cat(out)
             except Exception as exc:  # noqa: BLE001
                 print(f"[eval] esm2 baseline unavailable ({exc}); skipped", file=sys.stderr)
                 continue

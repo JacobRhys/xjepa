@@ -353,6 +353,9 @@ if [[ "$PHASE" == "eval" || "$PHASE" == "study" ]]; then
     --include 'data/eval/*' --local-dir . >/dev/null
   "$HF_CLI" download "$HF_REPO" --repo-type dataset \
     --include 'runs/*' --local-dir . >/dev/null
+  # Finished evals too, so a rerun resumes instead of recomputing them.
+  "$HF_CLI" download "$HF_REPO" --repo-type dataset \
+    --include 'results/*' --local-dir . >/dev/null 2>&1 || true
   # The public ESM-2 8M sanity anchor; run_eval skips it if this fails.
   pip install -q fair-esm >/dev/null 2>&1 || log "fair-esm unavailable; esm2 baseline will be skipped"
 fi
